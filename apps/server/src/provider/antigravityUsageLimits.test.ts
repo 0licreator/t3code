@@ -578,6 +578,29 @@ describe("Antigravity subscription limits", () => {
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 
+  // Only the ACP executable writes acp_token.json; the agy CLI keeps its own sign-in.
+  it.effect("does not read limits for a leftover ACP token beside the agy CLI's sign-in", () =>
+    Effect.gen(function* () {
+      const { probe, requests, tokenPath } = yield* fixture({ refreshToken: "stale-account-a" });
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      yield* fs.writeFileString(
+        path.join(path.dirname(tokenPath), "antigravity-oauth-token"),
+        JSON.stringify({
+          token: {
+            access_token: "access-token",
+            token_type: "Bearer",
+            refresh_token: "cli-account-b",
+            expiry: "2099-01-01T00:00:00Z",
+          },
+          auth_method: "consumer",
+        }),
+      );
+      yield* probe;
+      expect(requests.map((request) => request.body).join("\n")).not.toContain("stale-account-a");
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
   it.effect("names one Google account the same way from every sign-in", () =>
     Effect.gen(function* () {
       const read = (refreshToken: string, userId: string) =>
