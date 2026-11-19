@@ -1,6 +1,7 @@
-import { useAtomSet } from "@effect/atom-react";
+import { useAtomSet, useAtomValue } from "@effect/atom-react";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import {
+  connectLinkedEnvironment,
   createLinkedThreadSession,
   type LinkedThreadOpen,
   type LinkedThreadTarget,
@@ -12,6 +13,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { Atom } from "effect/reactivity";
 import { useState, useSyncExternalStore } from "react";
 
+import { connectPairing, reachesEnvironment } from "../connection/onboarding";
 import { getDocumentActivity } from "../lib/documentActivity";
 import { buildThreadRouteParams } from "../threadRoutes";
 import { useEnvironment } from "./environments";
@@ -71,6 +73,83 @@ export function useLinkedThreadOpener(
       });
     },
   };
+}
+
+/** A linked environment the add-environment dialog opens for, with what is known about it filled in. */
+export interface AddEnvironmentPrefill {
+  readonly environmentId: EnvironmentId;
+  readonly label: string;
+  readonly host: string | null;
+}
+
+export const addEnvironmentPrefillAtom = Atom.make<AddEnvironmentPrefill | null>(null).pipe(
+  Atom.withLabel("add-environment-prefill"),
+);
+
+export type LinkedEnvironmentConnectState =
+  | { readonly phase: "idle" | "connecting" }
+  | { readonly phase: "unreachable"; readonly label: string };
+
+/**
+ * Connects this client to the environment `target` lives in and opens the thread there. One step
+ * when the linking environment can get a pairing for this client; otherwise the add-environment
+ * dialog opens for that machine.
+ */
+export function useConnectLinkedEnvironment(target: LinkedThreadTarget) {
+  const navigate = useNavigate();
+  const closeView = useAtomSet(linkedThreadViewAtom);
+  const setPrefill = useAtomSet(addEnvironmentPrefillAtom);
+  const mayPair = useAtomValue(
+    peerLinkEnvironment.pairClient.permissionAtom(target.viaEnvironmentId),
+  );
+  const quiet = { reportFailure: false, reportDefect: false } as const;
+  const requestPairing = useAtomCommand(peerLinkEnvironment.pairClient, quiet);
+  const reaches = useAtomCommand(reachesEnvironment, quiet);
+  const pair = useAtomCommand(connectPairing, quiet);
+  const [state, setState] = useState<LinkedEnvironmentConnectState>({ phase: "idle" });
+  const connect = async () => {
+    setState({ phase: "connecting" });
+    const outcome = await connectLinkedEnvironment({
+      label: target.label,
+      requestPairing: async () => {
+        // Without it the linking environment refuses; the user can still pair by hand.
+        if (!mayPair) return null;
+        const result = await requestPairing({
+          environmentId: target.viaEnvironmentId,
+          input: { environmentId: target.environmentId },
+        });
+        return result._tag === "Success" ? result.value : null;
+      },
+      reaches: async (host) => {
+        const result = await reaches({ host, environmentId: target.environmentId });
+        return result._tag === "Success" && result.value;
+      },
+      pair: async ({ host, pairingCode }) => {
+        const result = await pair({
+          host,
+          pairingCode,
+          expectedEnvironmentId: target.environmentId,
+        });
+        return result._tag === "Success";
+      },
+    });
+    if (outcome.type === "unreachable") {
+      setState({ phase: "unreachable", label: outcome.label });
+      return outcome;
+    }
+    closeView(null);
+    if (outcome.type === "connected") {
+      void navigate({
+        to: "/$environmentId/$threadId",
+        params: buildThreadRouteParams(scopeThreadRef(target.environmentId, target.threadId)),
+      });
+      return outcome;
+    }
+    setPrefill({ environmentId: target.environmentId, label: outcome.label, host: outcome.host });
+    void navigate({ to: "/settings/connections" });
+    return outcome;
+  };
+  return { state, connect };
 }
 
 /**

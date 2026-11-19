@@ -7,15 +7,20 @@ import {
   presentLinkedThreadItem,
 } from "@t3tools/client-runtime/linked-thread";
 import { T, useGT, useMessages, Var } from "gt-react";
-import { ChevronRightIcon, EyeIcon } from "lucide-react";
+import { ChevronRightIcon, EyeIcon, PlugIcon } from "lucide-react";
 
 import { useEnvironment } from "../../state/environments";
-import { linkedThreadViewAtom, useLinkedThreadSession } from "../../state/linkedThreadView";
+import {
+  linkedThreadViewAtom,
+  useConnectLinkedEnvironment,
+  useLinkedThreadSession,
+} from "../../state/linkedThreadView";
 import ChatMarkdown from "../ChatMarkdown";
 import { Alert, AlertAction, AlertDescription, AlertTitle } from "../ui/alert";
 import { Button } from "../ui/button";
 import { Sheet, SheetDescription, SheetHeader, SheetPopup, SheetTitle } from "../ui/sheet";
 import { Spinner } from "../ui/spinner";
+import { toastManager } from "../ui/toast";
 
 function TruncatedNote() {
   return (
@@ -69,6 +74,18 @@ function LinkedThreadView(props: { readonly target: LinkedThreadTarget }) {
   const { state, session } = useLinkedThreadSession(target);
   const { transcript } = state;
   const label = transcript?.label ?? target.label;
+  const connection = useConnectLinkedEnvironment(target);
+  const connecting = connection.state.phase === "connecting";
+  const connect = async () => {
+    const outcome = await connection.connect();
+    if (outcome.type === "connected") {
+      toastManager.add({
+        type: "success",
+        title: gt("Connected to {label}", { label }),
+        description: gt("This device is paired with it and can use its threads."),
+      });
+    }
+  };
   const failure = state.error === null ? null : linkedThreadFailure(state.error, { via, label }, m);
   const retry = failure?.retryable ? (
     <AlertAction>
@@ -99,7 +116,25 @@ function LinkedThreadView(props: { readonly target: LinkedThreadTarget }) {
             ) : null}
           </span>
         </SheetDescription>
-        {/* A "Connect to interact" action belongs here once this client can pair with the linked environment. */}
+        <div>
+          <Button size="sm" variant="outline" disabled={connecting} onClick={() => void connect()}>
+            {connecting ? <Spinner /> : <PlugIcon aria-hidden />}
+            <T>Connect to interact</T>
+          </Button>
+        </div>
+        {connection.state.phase === "unreachable" ? (
+          <Alert variant="warning">
+            <AlertTitle>
+              {gt("{label} is not reachable from this device", { label: connection.state.label })}
+            </AlertTitle>
+            <AlertDescription>
+              <T>
+                Join a network it is on, such as its Tailscale network, and try again. You can keep
+                reading here.
+              </T>
+            </AlertDescription>
+          </Alert>
+        ) : null}
       </SheetHeader>
       {/* Reversed, so the view opens at the newest item and stays there as items arrive. */}
       <div className="flex min-h-0 flex-1 flex-col-reverse overflow-y-auto px-6 pb-6">

@@ -454,10 +454,10 @@
   "93e37fedae7eaa5b": "T3 Code auf {host} war zu beschäftigt, um zu antworten.",
   "5c5941732d5dfac6": "Die Kopplungsdaten sind ungültig.",
   "b8ca23ad7dda376e": "Diese Adresse führt zu {host}, einem anderen Rechner. Füge sie stattdessen als eigene Umgebung hinzu.",
+  "0c0150a90b582a7a": "Die URL der Umgebung ist ungültig.",
   "693cb5c4fb40f109": "Nur gespeicherte Bearer-Umgebungen können bearbeitet werden.",
   "5f5844b910cb1544": "Die gespeicherten Bearer-Zugangsdaten sind nicht verfügbar.",
   "51b0133f1ed3cf5c": "Die Bezeichnung der Umgebung darf nicht leer sein.",
-  "0c0150a90b582a7a": "Die URL der Umgebung ist ungültig.",
   "3aa15bfbe1920376": "Aktualisiere T3 Code auf {host} manuell; es kann sich nicht selbst aktualisieren.",
   "71907f57b7ec64d5": "{host} ist nicht mit einer kompatiblen T3-Code-Version zurückgekommen.",
   "e77ac580a4ddcd3b": "Verfügbar",
@@ -3597,7 +3597,10 @@
   ],
   "000b0df227182d39": "Andere Adresse…",
   "009e2ca841fdc1ef": "diese Umgebung",
+  "4ab24e2807a0d82f": "Mit {label} verbunden",
+  "b797c7beccf2dc46": "Dieses Gerät ist damit gekoppelt und kann seine Threads verwenden.",
   "1944f04b75ddf26d": "Thread auf {label}",
+  "93e690821c726e13": "{label} ist von diesem Gerät aus nicht erreichbar",
   "c8e6ea4d6313e912": "Langer Text, hier gekürzt.",
   "59fb6d9ab29a1513": [
     "Schreibgeschützt · auf ",
@@ -3614,6 +3617,8 @@
     }
   ],
   "ff1728d6a7065373": "Arbeitet",
+  "a446e3bda256c2b3": "Verbinden, um zu interagieren",
+  "d148218513d9950a": "Tritt einem Netzwerk bei, in dem es sich befindet, etwa seinem Tailscale-Netzwerk, und versuche es erneut. Du kannst hier weiterlesen.",
   "d0bda35aeec66684": [
     "Wird von ",
     {
@@ -7284,8 +7289,10 @@
   "53c162d8868a1d0e": "Umgebung hinzufügen",
   "53339e47accf021a": "Hosts durchsuchen oder devbox eingeben",
   "d808738388ab80b0": "Route zu {environment} hinzufügen",
+  "8a333daf9b7fd03f": "Mit {environment} verbinden",
   "7662025844bf543f": "Umgebung hinzufügen",
   "65b1d784a5e84254": "Kopple diesen Rechner erneut über eine andere Adresse, etwa seinen Tailscale-Namen. Er wird den vorhandenen Routen hinzugefügt, statt einen zweiten Rechner anzulegen.",
+  "e1cb1c8599e84e26": "Erstelle auf {environment} einen Kopplungscode, in dessen Einstellungen → Freigabe & Zugriff oder mit `t3 auth pairing create`, und gib ihn hier ein.",
   "1bea4864d46d70d0": "Eine weitere Umgebung mit diesem Client koppeln.",
   "9b24ef052b321e57": "Gib einen Backend-Host und einen Kopplungscode ein.",
   "3e20f17f71edf0ad": "Lokale SSH-Konfiguration, Agent und Tunnel für das Backend verwenden.",
