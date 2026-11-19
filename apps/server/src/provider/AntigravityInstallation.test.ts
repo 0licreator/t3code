@@ -29,6 +29,12 @@ import { type AntigravityReleaseAsset } from "./antigravityRelease.ts";
 
 const serverContents = "antigravity runtime\n";
 const harnessContents = "local harness\n";
+const nativePosixCliTarGz = Buffer.from(
+  "H4sIAAAAAAACE+3RMQ7CQAwEQNe8Ik8wgYj3XIFQCiiOCxK/56CJRA9CYqZZrxsXLpc2n2q5ze0en5LdYZpe2b1n5rhf5+d+m+MuY8j4guXaSu3n4z+V9f9DXXo5HzcBAAAAAAAAAADAz3sA56lbdQAoAAA=",
+  "base64",
+);
+const nativeCliArchive = (platform: NodeJS.Platform = hostPlatform) =>
+  platform === "win32" ? Buffer.from(serverContents) : nativePosixCliTarGz;
 const previousReleaseId = "1".repeat(64);
 const previousVersion = "fixture-old";
 const encodeJsonString = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
@@ -152,6 +158,19 @@ const makeHarness = Effect.fn("test.makeAntigravityInstallation")(function* (
   const asset =
     options.asset === undefined ? yield* releaseAsset(archive, platform) : options.asset;
   const managedDirectory = path.join(baseDir, "tools", "antigravity-acp", `${platform}-${arch}`);
+  if (options.baseDir === undefined && HostProcess.Platform.defaultValue() !== "win32") {
+    const versionsDir = path.join(managedDirectory, "versions");
+    yield* Effect.addFinalizer(() =>
+      fs.readDirectory(versionsDir).pipe(
+        Effect.flatMap((entries) =>
+          Effect.forEach(entries, (entry) =>
+            fs.chmod(path.join(versionsDir, entry), 0o700).pipe(Effect.ignore),
+          ),
+        ),
+        Effect.ignore,
+      ),
+    );
+  }
   if (options.previous) {
     yield* writeRelease(managedDirectory, {
       ...(yield* releaseAsset(archive, platform)),
@@ -1559,5 +1578,301 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("Antigravity inst
       expect(yield* installation.state).toMatchObject({ phase: "idle", operationId: null });
       expect(requests).toEqual([]);
     }),
+  );
+
+  it.effect(
+    "locks CLI releases on POSIX, detects on-disk changes, and recovers on same-releaseId reinstall",
+    () =>
+      Effect.gen(function* () {
+        const archive = nativeCliArchive();
+        const { installation, fs, path, baseDir, stagingReleased } = yield* makeHarness({
+          native: true,
+          archive,
+        });
+        yield* installation.start;
+        expect(yield* terminalState(installation)).toMatchObject({
+          phase: "succeeded",
+          installedVersion: "1.5.7",
+        });
+        yield* Deferred.await(stagingReleased);
+
+        const installed = yield* installation.resolve();
+        const releaseDir = installed.managedVersionDirectory!;
+        const recordPath = path.join(releaseDir, ".install-complete.json");
+
+        if (hostPlatform !== "win32") {
+          expect((yield* fs.stat(releaseDir)).mode & 0o777).toBe(0o500);
+          expect((yield* fs.stat(installed.executablePath)).mode & 0o777).toBe(0o555);
+          expect((yield* fs.stat(recordPath)).mode & 0o777).toBe(0o400);
+          if (process.getuid?.() !== 0) {
+            const stagingAttempt = yield* fs
+              .makeDirectory(path.join(releaseDir, "auto-update-staging"))
+              .pipe(Effect.exit);
+            expect(Exit.isFailure(stagingAttempt)).toBe(true);
+          }
+
+          // Existing writable CLI releases are re-locked on startup.
+          yield* fs.chmod(releaseDir, 0o700);
+          yield* fs.chmod(installed.executablePath, 0o755);
+          yield* fs.chmod(recordPath, 0o600);
+          const relocked = yield* makeHarness({ baseDir, native: true, archive });
+          expect(yield* relocked.installation.state).toMatchObject({
+            phase: "idle",
+            installedVersion: "1.5.7",
+          });
+          expect((yield* fs.stat(releaseDir)).mode & 0o777).toBe(0o500);
+          expect((yield* fs.stat(installed.executablePath)).mode & 0o777).toBe(0o555);
+          expect((yield* fs.stat(recordPath)).mode & 0o777).toBe(0o400);
+        }
+
+        // Simulate an external self-update mutating the managed binary in place.
+        if (hostPlatform !== "win32") {
+          yield* fs.chmod(releaseDir, 0o700);
+          yield* fs.chmod(installed.executablePath, 0o755);
+        }
+        yield* fs.writeFileString(installed.executablePath, `${serverContents}self-updated\n`, {
+          mode: 0o755,
+        });
+
+        const resolveError = yield* installation.resolve().pipe(Effect.flip);
+        expect(resolveError.detail).toContain("changed on disk");
+
+        const restarted = yield* makeHarness({ baseDir, native: true, archive });
+        expect(yield* restarted.installation.state).toMatchObject({
+          phase: "failed",
+          installedVersion: null,
+        });
+        expect((yield* restarted.installation.state).message).toContain("changed on disk");
+
+        // Reinstalling the same releaseId replaces the damaged directory cleanly.
+        yield* restarted.installation.start;
+        expect(yield* terminalState(restarted.installation)).toMatchObject({
+          phase: "succeeded",
+          installedVersion: "1.5.7",
+        });
+        yield* Deferred.await(restarted.stagingReleased);
+
+        const repaired = yield* restarted.installation.resolve();
+        expect(repaired.version).toBe("1.5.7");
+        expect(yield* fs.readFileString(repaired.executablePath)).toBe(serverContents);
+        if (hostPlatform !== "win32") {
+          expect((yield* fs.stat(releaseDir)).mode & 0o777).toBe(0o500);
+          expect((yield* fs.stat(repaired.executablePath)).mode & 0o777).toBe(0o555);
+        }
+
+        // remove() unlocks and deletes read-only CLI releases cleanly.
+        yield* restarted.installation.remove();
+        expect(yield* fs.exists(restarted.installation.managedDirectory)).toBe(false);
+      }),
+  );
+
+  it.effect(
+    "restores displaced files on repair publish failure and rejects symlinked managed binaries",
+    () =>
+      Effect.gen(function* () {
+        const archive = nativeCliArchive();
+        const { installation, fs, path, baseDir, stagingReleased } = yield* makeHarness({
+          native: true,
+          archive,
+        });
+        yield* installation.start;
+        expect((yield* terminalState(installation)).phase).toBe("succeeded");
+        yield* Deferred.await(stagingReleased);
+        const installed = yield* installation.resolve();
+        const releaseDir = installed.managedVersionDirectory!;
+        const damagedContents = `${serverContents}damaged\n`;
+
+        if (hostPlatform !== "win32") {
+          yield* fs.chmod(releaseDir, 0o700);
+          yield* fs.chmod(installed.executablePath, 0o755);
+        }
+        yield* fs.writeFileString(installed.executablePath, damagedContents, { mode: 0o755 });
+
+        // Fail the publish rename (staged -> destination) after moving the damaged release aside.
+        let renameToDestinationCount = 0;
+        const failingRepair = yield* makeHarness({
+          baseDir,
+          native: true,
+          archive,
+          fileSystem: FileSystem.FileSystem.of({
+            ...fs,
+            rename: (from, to) => {
+              if (to === releaseDir && ++renameToDestinationCount === 1) {
+                return Effect.fail(
+                  PlatformError.systemError({
+                    _tag: "AlreadyExists",
+                    module: "FileSystem",
+                    method: "rename",
+                    pathOrDescriptor: to,
+                    description: "EEXIST: simulated publish failure",
+                  }),
+                );
+              }
+              return fs.rename(from, to);
+            },
+          }),
+        });
+        yield* failingRepair.installation.start;
+        expect(yield* terminalState(failingRepair.installation)).toMatchObject({
+          phase: "failed",
+        });
+        yield* Deferred.await(failingRepair.stagingReleased);
+        // The damaged directory was rolled back instead of being left missing.
+        expect(yield* fs.readFileString(installed.executablePath)).toBe(damagedContents);
+
+        // If pointer write fails (e.g. ENOSPC) after repair swapped files in, rollback restores the displaced copy.
+        const failingPointerWrite = yield* makeHarness({
+          baseDir,
+          native: true,
+          archive,
+          fileSystem: FileSystem.FileSystem.of({
+            ...fs,
+            writeFileString: (target, content, options) =>
+              path.basename(target) === "contents.tmp"
+                ? Effect.fail(
+                    PlatformError.systemError({
+                      _tag: "Unknown",
+                      module: "FileSystem",
+                      method: "writeFileString",
+                      pathOrDescriptor: target,
+                      description: "ENOSPC: no space left on device",
+                    }),
+                  )
+                : fs.writeFileString(target, content, options),
+          }),
+        });
+        yield* failingPointerWrite.installation.start;
+        expect(yield* terminalState(failingPointerWrite.installation)).toMatchObject({
+          phase: "failed",
+        });
+        yield* Deferred.await(failingPointerWrite.stagingReleased);
+        expect(yield* fs.readFileString(installed.executablePath)).toBe(damagedContents);
+
+        // A symlinked executable is rejected and startup does not chmod its target.
+        if (hostPlatform !== "win32") {
+          const outsideTarget = path.join(baseDir, "outside-target");
+          yield* fs.writeFileString(outsideTarget, serverContents, { mode: 0o755 });
+          yield* fs.remove(installed.executablePath);
+          yield* fs.symlink(outsideTarget, installed.executablePath);
+          const symlinked = yield* makeHarness({ baseDir, native: true, archive });
+          expect((yield* symlinked.installation.state).phase).toBe("failed");
+          expect(yield* symlinked.installation.resolve().pipe(Effect.flip)).toMatchObject({
+            operation: "resolve",
+          });
+          expect((yield* fs.stat(outsideTarget)).mode & 0o777).toBe(0o755);
+        }
+
+        // A regular file occupying the release directory path is classified as incomplete and replaced on reinstall.
+        if (hostPlatform !== "win32") {
+          yield* fs.chmod(releaseDir, 0o700);
+        }
+        yield* fs.remove(releaseDir, { recursive: true, force: true });
+        yield* fs.writeFileString(releaseDir, "not a directory");
+        expect(yield* installation.resolve().pipe(Effect.flip)).toMatchObject({
+          operation: "resolve",
+        });
+        const repairedFromFile = yield* makeHarness({ baseDir, native: true, archive });
+        yield* repairedFromFile.installation.start;
+        expect(yield* terminalState(repairedFromFile.installation)).toMatchObject({
+          phase: "succeeded",
+          installedVersion: "1.5.7",
+        });
+        yield* Deferred.await(repairedFromFile.stagingReleased);
+        expect(yield* fs.readFileString(installed.executablePath)).toBe(serverContents);
+
+        // A second service acquiring a custom binaryPath (or external symlink to it) during a
+        // repair swap waits for the managed lock instead of missing the briefly displaced binary.
+        if (hostPlatform !== "win32") {
+          yield* fs.chmod(releaseDir, 0o700);
+          yield* fs.chmod(installed.executablePath, 0o755);
+        }
+        yield* fs.writeFileString(installed.executablePath, damagedContents, { mode: 0o755 });
+        const externalSymlink = path.join(baseDir, "external-agy-link");
+        if (hostPlatform !== "win32") {
+          yield* fs.symlink(installed.executablePath, externalSymlink);
+        }
+        const displacedPaused = yield* Deferred.make<void>();
+        const resumeSwap = yield* Deferred.make<void>();
+        const pausedRepair = yield* makeHarness({
+          baseDir,
+          native: true,
+          archive,
+          fileSystem: FileSystem.FileSystem.of({
+            ...fs,
+            rename: (from, to) =>
+              from === releaseDir && path.basename(to) === "displaced"
+                ? fs
+                    .rename(from, to)
+                    .pipe(
+                      Effect.andThen(Deferred.succeed(displacedPaused, undefined)),
+                      Effect.andThen(Deferred.await(resumeSwap)),
+                    )
+                : fs.rename(from, to),
+          }),
+        });
+        const managedDir = pausedRepair.installation.managedDirectory;
+        let watchResolveExists = false;
+        const expectedResolves = hostPlatform !== "win32" ? 2 : 1;
+        let seenResolves = 0;
+        const resolversEntered = yield* Deferred.make<void>();
+        const secondServer = yield* makeHarness({
+          baseDir,
+          native: true,
+          archive,
+          fileSystem: FileSystem.FileSystem.of({
+            ...fs,
+            exists: (target) =>
+              watchResolveExists && target === managedDir
+                ? Effect.suspend(() => {
+                    seenResolves += 1;
+                    return seenResolves >= expectedResolves
+                      ? Deferred.succeed(resolversEntered, undefined).pipe(
+                          Effect.andThen(fs.exists(target)),
+                        )
+                      : fs.exists(target);
+                  })
+                : fs.exists(target),
+          }),
+        });
+        yield* Effect.gen(function* () {
+          yield* pausedRepair.installation.start;
+          yield* Deferred.await(displacedPaused);
+          expect(yield* fs.exists(releaseDir)).toBe(false);
+          watchResolveExists = true;
+          const acquireFiber = yield* secondServer.installation
+            .acquire(installed.executablePath)
+            .pipe(Effect.scoped, Effect.forkScoped);
+          const symlinkResolveFiber =
+            hostPlatform !== "win32"
+              ? yield* secondServer.installation.resolve(externalSymlink).pipe(Effect.forkScoped)
+              : null;
+          yield* Deferred.await(resolversEntered);
+          expect(yield* fs.exists(`${managedDir}.lock`)).toBe(true);
+          expect(yield* fs.exists(releaseDir)).toBe(false);
+          expect(acquireFiber.pollUnsafe()).toBeUndefined();
+          if (symlinkResolveFiber !== null) {
+            expect(symlinkResolveFiber.pollUnsafe()).toBeUndefined();
+          }
+          yield* Deferred.succeed(resumeSwap, undefined);
+          expect(yield* terminalState(pausedRepair.installation)).toMatchObject({
+            phase: "succeeded",
+          });
+          const acquired = yield* Fiber.join(acquireFiber);
+          expect(acquired).toMatchObject({
+            source: "override",
+            executablePath: installed.executablePath,
+            version: "1.5.7",
+          });
+          if (symlinkResolveFiber !== null) {
+            expect(yield* Fiber.join(symlinkResolveFiber)).toMatchObject({
+              source: "override",
+              executablePath: installed.executablePath,
+              version: "1.5.7",
+            });
+          }
+          expect(yield* fs.readFileString(acquired.executablePath)).toBe(serverContents);
+          yield* Deferred.await(pausedRepair.stagingReleased);
+        }).pipe(Effect.ensuring(Deferred.succeed(resumeSwap, undefined).pipe(Effect.asVoid)));
+      }),
   );
 });

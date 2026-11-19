@@ -21,6 +21,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import type { PlatformError } from "effect/PlatformError";
+import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
 import * as Schedule from "effect/Schedule";
 import * as Scope from "effect/Scope";
@@ -33,6 +34,7 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as NodeCrypto from "node:crypto";
 import * as NodeFSP from "node:fs/promises";
 import * as EffectAcpErrors from "effect-acp/errors";
+import { lock } from "proper-lockfile";
 
 import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -86,6 +88,7 @@ const InstalledRelease = Schema.Struct({
 type InstalledRelease = typeof InstalledRelease.Type;
 const encodeActiveRelease = Schema.encodeEffect(Schema.fromJsonString(ActiveRelease));
 const encodeInstalledRelease = Schema.encodeEffect(Schema.fromJsonString(InstalledRelease));
+const decodeInstalledRelease = Schema.decodeEffect(Schema.fromJsonString(InstalledRelease));
 
 export class AntigravityInstallationError extends Schema.TaggedError<AntigravityInstallationError>()(
   "AntigravityInstallationError",
@@ -298,11 +301,209 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
     );
   });
 
-  const completedRelease = Effect.fn("AntigravityInstallation.completedRelease")(function* (
+  const isSymlink = Effect.fn("AntigravityInstallation.isSymlink")(function* (filePath: string) {
+    return Option.isSome(yield* fs.readLink(filePath).pipe(Effect.option));
+  });
+
+  const isInsideManagedVersions = Effect.fn("AntigravityInstallation.isInsideManagedVersions")(
+    function* (directory: string) {
+      if (
+        (yield* isSymlink(managedDirectory)) ||
+        (yield* isSymlink(versionsDirectory)) ||
+        (yield* isSymlink(directory))
+      ) {
+        return false;
+      }
+      const realVersions = yield* fs.realPath(versionsDirectory).pipe(Effect.option);
+      const realDirectory = yield* fs.realPath(directory).pipe(Effect.option);
+      return (
+        Option.isSome(realVersions) &&
+        Option.isSome(realDirectory) &&
+        realDirectory.value.startsWith(`${realVersions.value}${path.sep}`)
+      );
+    },
+  );
+
+  const lockReleaseDirectory = Effect.fn("AntigravityInstallation.lockReleaseDirectory")(function* (
+    directory: string,
+    executablePath: string,
+    strict = true,
+  ) {
+    if (platform === "win32") return;
+    const recordPath = path.join(directory, RELEASE_RECORD);
+    if (
+      !(yield* isInsideManagedVersions(directory)) ||
+      (yield* isSymlink(executablePath)) ||
+      (yield* isSymlink(recordPath))
+    ) {
+      if (strict) {
+        return yield* installationError(
+          "activate",
+          "Could not lock the managed Antigravity runtime permissions.",
+        );
+      }
+      return;
+    }
+    const apply = Effect.gen(function* () {
+      yield* fs.chmod(executablePath, 0o555);
+      yield* fs.chmod(recordPath, 0o400);
+      yield* fs.chmod(directory, 0o500);
+    });
+    if (strict) {
+      yield* apply.pipe(
+        Effect.mapError((cause) =>
+          installationError(
+            "activate",
+            "Could not lock the managed Antigravity runtime permissions.",
+            cause,
+          ),
+        ),
+      );
+    } else {
+      yield* apply.pipe(Effect.ignore);
+    }
+  });
+
+  const unlockDirectoryTree = Effect.fn("AntigravityInstallation.unlockDirectoryTree")(function* (
+    directory: string,
+  ): Effect.fn.Return<void, never> {
+    if (platform === "win32") return;
+    if (
+      (yield* isSymlink(managedDirectory)) ||
+      (yield* isSymlink(versionsDirectory)) ||
+      (yield* isSymlink(directory))
+    ) {
+      return;
+    }
+    if (directory !== versionsDirectory && !(yield* isInsideManagedVersions(directory))) {
+      return;
+    }
+    const rootInfo = yield* fs.stat(directory).pipe(Effect.option);
+    if (Option.isNone(rootInfo) || rootInfo.value.type !== "Directory") return;
+    yield* fs.chmod(directory, 0o700).pipe(Effect.ignore);
+    const entries = yield* fs.readDirectory(directory).pipe(Effect.orElseSucceed(() => []));
+    for (const entry of entries) {
+      const entryPath = path.join(directory, entry);
+      if (yield* isSymlink(entryPath)) continue;
+      const info = yield* fs.stat(entryPath).pipe(Effect.option);
+      if (Option.isSome(info) && info.value.type === "Directory") {
+        yield* unlockDirectoryTree(entryPath);
+      }
+    }
+  });
+
+  const removeReleaseDirectory = Effect.fn("AntigravityInstallation.removeReleaseDirectory")(
+    function* (directory: string) {
+      yield* unlockDirectoryTree(directory);
+      yield* fs
+        .remove(directory, { recursive: true, force: true })
+        .pipe(retryWhileWindowsHoldsHandles);
+    },
+  );
+
+  // Serialize publish, activation, pruning, and removal across server instances sharing managedDirectory.
+  // Locking managedDirectory places the lock directory beside it so remove() can delete managedDirectory safely.
+  const withManagedLock = <A, E, R>(
+    operation: "activate" | "remove" | "resolve",
+    effect: Effect.Effect<A, E, R>,
+  ): Effect.Effect<A, E | AntigravityInstallationError, R> =>
+    Effect.scoped(
+      Effect.acquireRelease(
+        Effect.tryPromise({
+          try: () =>
+            lock(managedDirectory, {
+              realpath: false,
+              stale: 30_000,
+              update: 10_000,
+              retries: { retries: 60, minTimeout: 25, maxTimeout: 150 },
+              onCompromised: () => {},
+            }),
+          catch: (cause) =>
+            installationError(
+              operation,
+              Predicate.isObject(cause) &&
+                Predicate.hasProperty(cause, "code") &&
+                cause.code === "ELOCKED"
+                ? "Another Antigravity installation is already in progress. Try again."
+                : "Could not lock the managed Antigravity directory. Try again.",
+              cause,
+            ),
+        }),
+        (release) => Effect.promise(() => release().catch(() => undefined)),
+      ).pipe(Effect.andThen(effect)),
+    );
+
+  const inspectManagedFile = Effect.fn("AntigravityInstallation.inspectManagedFile")(function* (
+    filePath: string,
+    expectedBytes: number,
+  ) {
+    if (yield* isSymlink(filePath)) return "incomplete" as const;
+    const info = yield* fs.stat(filePath).pipe(
+      Effect.catchIf(
+        (error) => error.reason._tag === "NotFound",
+        () => Effect.succeed(null),
+      ),
+    );
+    if (
+      info === null ||
+      info.type !== "File" ||
+      (platform !== "win32" && (info.mode & 0o111) === 0)
+    ) {
+      return "incomplete" as const;
+    }
+    return Number(info.size) === expectedBytes ? ("ok" as const) : ("changed" as const);
+  });
+
+  const inspectRelease = Effect.fn("AntigravityInstallation.inspectRelease")(function* (
     releaseId: string,
   ) {
+    const incomplete = () =>
+      ({
+        _tag: "repairable",
+        error: installationError(
+          "resolve",
+          "The managed Antigravity runtime is incomplete. Reinstall it.",
+        ),
+      }) as const;
+    const invalidRecord = () =>
+      ({
+        _tag: "repairable",
+        error: installationError(
+          "resolve",
+          "The managed runtime record is invalid. Reinstall Antigravity.",
+        ),
+      }) as const;
     const directory = path.join(versionsDirectory, releaseId);
-    const record = yield* readRecord(path.join(directory, RELEASE_RECORD), InstalledRelease);
+    if (yield* isSymlink(directory)) return incomplete();
+    const directoryInfo = yield* fs.stat(directory).pipe(
+      Effect.catchIf(
+        (error) => error.reason._tag === "NotFound",
+        () => Effect.succeed(null),
+      ),
+    );
+    if (directoryInfo === null || directoryInfo.type !== "Directory") return incomplete();
+    const recordPath = path.join(directory, RELEASE_RECORD);
+    if (yield* isSymlink(recordPath)) return incomplete();
+    const recordInfo = yield* fs.stat(recordPath).pipe(
+      Effect.catchIf(
+        (error) => error.reason._tag === "NotFound",
+        () => Effect.succeed(null),
+      ),
+    );
+    if (recordInfo === null) return incomplete();
+    if (recordInfo.type !== "File" || Number(recordInfo.size) > RECORD_MAX_BYTES) {
+      return invalidRecord();
+    }
+    const contents = yield* fs.readFileString(recordPath).pipe(
+      Effect.catchIf(
+        (error) => error.reason._tag === "NotFound",
+        () => Effect.succeed(null),
+      ),
+    );
+    if (contents === null) return incomplete();
+    const decoded = yield* decodeInstalledRelease(contents).pipe(Effect.option);
+    if (Option.isNone(decoded)) return invalidRecord();
+    const record = decoded.value;
     if (
       record.releaseId !== releaseId ||
       (record.harness === null
@@ -312,26 +513,49 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
       record.executable.bytes <= 0 ||
       (record.harness !== null &&
         (!Number.isSafeInteger(record.harness.bytes) || record.harness.bytes <= 0)) ||
-      !record.version.trim() ||
-      !(yield* executableFile(
-        path.join(directory, record.executable.name),
-        record.executable.bytes,
-      )) ||
-      (record.harness !== null &&
-        !(yield* executableFile(path.join(directory, record.harness.name), record.harness.bytes)))
+      !record.version.trim()
     ) {
-      return yield* installationError(
-        "resolve",
-        "The managed Antigravity runtime is incomplete. Reinstall it.",
-      );
+      return incomplete();
+    }
+    const executablePath = path.join(directory, record.executable.name);
+    const executableStatus = yield* inspectManagedFile(executablePath, record.executable.bytes);
+    const harnessStatus =
+      record.harness === null
+        ? ("ok" as const)
+        : yield* inspectManagedFile(
+            path.join(directory, record.harness.name),
+            record.harness.bytes,
+          );
+    if (executableStatus === "incomplete" || harnessStatus === "incomplete") {
+      return incomplete();
+    }
+    if (executableStatus === "changed" || harnessStatus === "changed") {
+      return {
+        _tag: "repairable" as const,
+        error: installationError(
+          "resolve",
+          "The managed Antigravity runtime changed on disk. Reinstall it in Antigravity setup.",
+        ),
+      };
     }
     return {
-      executablePath: path.join(directory, record.executable.name),
-      harnessPath: record.harness === null ? null : path.join(directory, record.harness.name),
-      source: "managed",
-      version: record.version,
-      managedVersionDirectory: directory,
-    } satisfies AntigravityExecutable;
+      _tag: "valid" as const,
+      executable: {
+        executablePath,
+        harnessPath: record.harness === null ? null : path.join(directory, record.harness.name),
+        source: "managed" as const,
+        version: record.version,
+        managedVersionDirectory: directory,
+      } satisfies AntigravityExecutable,
+    };
+  });
+
+  const completedRelease = Effect.fn("AntigravityInstallation.completedRelease")(function* (
+    releaseId: string,
+  ) {
+    const inspected = yield* inspectRelease(releaseId);
+    if (inspected._tag === "repairable") return yield* inspected.error;
+    return inspected.executable;
   });
 
   // Infer helper pairing only from a plain launcher with one literal executable path.
@@ -426,43 +650,53 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
     return candidates;
   });
 
+  const resolveUnlocked = Effect.fn("AntigravityInstallation.resolveUnlocked")(function* (
+    binaryPath?: string,
+    processEnvironment?: NodeJS.ProcessEnv,
+  ) {
+    const override = expandHomePath(binaryPath?.trim() ?? "", yield* HostProcess.HomeDirectory);
+    if (override) {
+      for (const candidate of yield* commandCandidates(override, processEnvironment)) {
+        const selected = yield* fromExternal(candidate, "override");
+        if (selected) return selected;
+      }
+      return yield* installationError(
+        "resolve",
+        "The custom Antigravity executable is missing or not executable, or it needs a localharness_external sibling. The agy CLI does not.",
+      );
+    }
+    if (yield* fs.exists(activePath)) {
+      const active = yield* readRecord(activePath, ActiveRelease);
+      const managed = yield* completedRelease(active.releaseId);
+      if (yield* isWithdrawn(managed.version))
+        return yield* installationError(
+          "resolve",
+          `Antigravity ${managed.version} no longer works with this T3 Code release. Update it in Antigravity setup.`,
+        );
+      return managed;
+    }
+    for (const command of [names.executable, "agy"]) {
+      for (const candidate of yield* commandCandidates(command, processEnvironment)) {
+        const selected = yield* fromExternal(candidate, "path");
+        if (selected) return selected;
+      }
+    }
+    return yield* installationError(
+      "resolve",
+      supported
+        ? "Antigravity ACP runtime is not installed. Install it in this environment's provider settings or set a custom ACP executable path. The Antigravity app, IDE, and CLI are separate installations."
+        : `Google does not publish an Antigravity runtime for ${platform}-${arch}. Use a supported environment or a custom executable.`,
+    );
+  });
+
   const resolve: AntigravityInstallationService["resolve"] = Effect.fn(
     "AntigravityInstallation.resolve",
   )(
     function* (binaryPath?: string, processEnvironment?: NodeJS.ProcessEnv) {
-      const override = expandHomePath(binaryPath?.trim() ?? "", yield* HostProcess.HomeDirectory);
-      if (override) {
-        for (const candidate of yield* commandCandidates(override, processEnvironment)) {
-          const selected = yield* fromExternal(candidate, "override");
-          if (selected) return selected;
-        }
-        return yield* installationError(
-          "resolve",
-          "The custom Antigravity executable is missing or not executable, or it needs a localharness_external sibling. The agy CLI does not.",
-        );
-      }
-      if (yield* fs.exists(activePath)) {
-        const active = yield* readRecord(activePath, ActiveRelease);
-        const installed = yield* completedRelease(active.releaseId);
-        if (yield* isWithdrawn(installed.version))
-          return yield* installationError(
-            "resolve",
-            `Antigravity ${installed.version} no longer works with this T3 Code release. Update it in Antigravity setup.`,
-          );
-        return installed;
-      }
-      for (const command of [names.executable, "agy"]) {
-        for (const candidate of yield* commandCandidates(command, processEnvironment)) {
-          const selected = yield* fromExternal(candidate, "path");
-          if (selected) return selected;
-        }
-      }
-      return yield* installationError(
-        "resolve",
-        supported
-          ? "Antigravity ACP runtime is not installed. Install it in this environment's provider settings or set a custom ACP executable path. The Antigravity app, IDE, and CLI are separate installations."
-          : `Google does not publish an Antigravity runtime for ${platform}-${arch}. Use a supported environment or a custom executable.`,
-      );
+      const lookup = resolveUnlocked(binaryPath, processEnvironment);
+      return (yield* fs.exists(managedDirectory))
+        ? yield* withManagedLock("resolve", lookup)
+        : yield* lookup;
     },
     Effect.mapError(
       wrapFailure(
@@ -582,16 +816,21 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
       }),
     );
 
-  // Each update lands in its own directory. Best effort: a busy gate means a session is
-  // resolving, so the next start or update finishes the cleanup.
-  const pruneInactiveReleases = Effect.gen(function* () {
+  const pruneInactiveReleasesBody = Effect.gen(function* () {
     const active = yield* readRecord(activePath, ActiveRelease);
     for (const entry of yield* fs.readDirectory(versionsDirectory)) {
       if (entry === active.releaseId || !/^[a-f0-9]{64}$/u.test(entry)) continue;
       const directory = path.join(versionsDirectory, entry);
       if (leases.has(directory)) continue;
-      yield* fs.remove(directory, { recursive: true, force: true }).pipe(Effect.ignore);
+      yield* removeReleaseDirectory(directory).pipe(Effect.ignore);
     }
+  });
+
+  // Each update lands in its own directory. Best effort: a busy gate or cross-server lock means
+  // another operation is active, so the next start or update finishes the cleanup.
+  const pruneInactiveReleases = Effect.gen(function* () {
+    if (!(yield* fs.exists(activePath))) return;
+    yield* withManagedLock("activate", pruneInactiveReleasesBody);
   }).pipe(
     gate.withPermitsIfAvailable(1),
     Effect.ignore,
@@ -630,20 +869,26 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
       yield* fs.makeDirectory(versionsDirectory, { recursive: true });
       yield* SubscriptionRef.update(state, (current) => ({ ...current, canRemove: true }));
       const destination = path.join(versionsDirectory, releaseId);
-      const activate = Effect.fn("AntigravityInstallation.activate")(
-        function* () {
+      const writeAndActivate = Effect.fn("AntigravityInstallation.writeAndActivate")(
+        function* (pointerDirectory: string) {
           yield* ensureEligible(asset.version);
-          const pointerDirectory = yield* fs.makeTempDirectoryScoped({
-            directory: managedDirectory,
-            prefix: "active.json.",
-          });
+          const verified = yield* inspectRelease(releaseId);
+          if (verified._tag !== "valid" || verified.executable.version !== asset.version) {
+            return yield* installationError(
+              "activate",
+              "The Antigravity release changed before activation. Try again.",
+            );
+          }
+          if (verified.executable.harnessPath === null) {
+            yield* lockReleaseDirectory(destination, verified.executable.executablePath);
+          }
           const pointerPath = path.join(pointerDirectory, "contents.tmp");
           yield* fs.writeFileString(pointerPath, yield* encodeActiveRelease({ releaseId }), {
             flag: "wx",
             mode: 0o600,
           });
           yield* fs.rename(pointerPath, activePath);
-          yield* pruneInactiveReleases;
+          yield* pruneInactiveReleasesBody.pipe(Effect.ignore);
           yield* SubscriptionRef.update(
             state,
             (current) =>
@@ -655,7 +900,6 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
               }) satisfies ProviderInstallState,
           );
         },
-        Effect.scoped,
         Effect.mapError(
           wrapFailure(
             "activate",
@@ -664,19 +908,38 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
         ),
         Effect.uninterruptible,
       );
+      const activate = Effect.fn("AntigravityInstallation.activate")(function* () {
+        const pointerDirectory = yield* fs.makeTempDirectoryScoped({
+          directory: managedDirectory,
+          prefix: "active.json.",
+        });
+        yield* gate.withPermit(withManagedLock("activate", writeAndActivate(pointerDirectory)));
+      }, Effect.scoped);
 
-      if (yield* fs.exists(destination)) {
-        const existing = yield* completedRelease(releaseId);
-        if (existing.version !== asset.version) {
+      if ((yield* fs.exists(destination)) || (yield* isSymlink(destination))) {
+        const inspected = yield* inspectRelease(releaseId);
+        if (inspected._tag === "valid") {
+          if (inspected.executable.version !== asset.version) {
+            return yield* installationError(
+              "verify",
+              "The existing managed release has the wrong version. Remove it before reinstalling.",
+            );
+          }
+          yield* report("verifying", "Checking the installed runtime.");
+          yield* validate(inspected.executable, asset.version).pipe(
+            Effect.scoped,
+            withValidationTimeout,
+          );
+          yield* activate();
+          return;
+        }
+        // acquire() cannot lease a broken release, but an already-running session may hold one.
+        if (leases.has(destination)) {
           return yield* installationError(
-            "verify",
-            "The existing managed release has the wrong version. Remove it before reinstalling.",
+            "install",
+            "Stop Antigravity sessions and sign-in flows before reinstalling its managed runtime.",
           );
         }
-        yield* report("verifying", "Checking the installed runtime.");
-        yield* validate(existing, asset.version).pipe(Effect.scoped, withValidationTimeout);
-        yield* activate();
-        return;
       }
 
       const available = yield* Effect.tryPromise({
@@ -699,6 +962,7 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
         directory: versionsDirectory,
         prefix: ".install-",
       });
+      yield* Effect.addFinalizer(() => unlockDirectoryTree(staging));
       const archivePath = path.join(staging, "download.zip");
       const pairDirectory = path.join(staging, "runtime");
       yield* fs.makeDirectory(pairDirectory);
@@ -949,33 +1213,142 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
         yield* encodeInstalledRelease(record),
         { flag: "wx", mode: 0o600 },
       );
-      yield* fs.rename(pairDirectory, destination).pipe(
-        retryWhileWindowsHoldsHandles,
-        Effect.catch((cause) =>
-          completedRelease(releaseId).pipe(
-            Effect.flatMap((existing) =>
-              existing.version === asset.version
-                ? validate(existing, asset.version).pipe(Effect.scoped, withValidationTimeout)
-                : Effect.fail(
-                    installationError(
+      // Lock files read-only before publishing; the directory itself is locked after cross-parent rename
+      // because macOS requires write permission on a moved directory to update its `..` entry.
+      if (cli && platform !== "win32") {
+        yield* fs.chmod(executablePath, 0o555);
+        yield* fs.chmod(path.join(pairDirectory, RELEASE_RECORD), 0o400);
+      }
+      const published = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const pointerDirectory = yield* fs.makeTempDirectoryScoped({
+            directory: managedDirectory,
+            prefix: "active.json.",
+          });
+          return yield* gate.withPermit(
+            withManagedLock(
+              "activate",
+              Effect.gen(function* () {
+                const destinationExisted =
+                  (yield* fs.exists(destination)) || (yield* isSymlink(destination));
+                if (!destinationExisted) {
+                  const renameError = yield* fs.rename(pairDirectory, destination).pipe(
+                    retryWhileWindowsHoldsHandles,
+                    Effect.as(null),
+                    Effect.catch((cause) => Effect.succeed(cause)),
+                  );
+                  if (renameError === null) {
+                    const activateError = yield* writeAndActivate(pointerDirectory).pipe(
+                      Effect.as(null),
+                      Effect.catch((cause) => Effect.succeed(cause)),
+                    );
+                    if (activateError !== null) {
+                      yield* removeReleaseDirectory(destination).pipe(Effect.ignore);
+                      return yield* activateError;
+                    }
+                    return { _tag: "published" as const };
+                  }
+                  if (!(yield* fs.exists(destination)) && !(yield* isSymlink(destination))) {
+                    return yield* installationError(
+                      "activate",
+                      "Could not publish the Antigravity runtime. The previous release is unchanged. Try again.",
+                      renameError,
+                    );
+                  }
+                }
+                const inspected = yield* inspectRelease(releaseId);
+                if (inspected._tag === "valid") {
+                  if (inspected.executable.version !== asset.version) {
+                    return yield* installationError(
                       "activate",
                       "Another installation published a different Antigravity release.",
+                    );
+                  }
+                  return { _tag: "existing" as const, executable: inspected.executable };
+                }
+                // acquire() cannot lease a broken release, but an already-running session may hold one.
+                if (leases.has(destination)) {
+                  return yield* installationError(
+                    "activate",
+                    "Stop Antigravity sessions and sign-in flows before reinstalling its managed runtime.",
+                  );
+                }
+                // Move the damaged release aside into staging so failure can restore it.
+                const displaced = path.join(staging, "displaced");
+                yield* unlockDirectoryTree(destination);
+                yield* fs.rename(destination, displaced).pipe(
+                  retryWhileWindowsHoldsHandles,
+                  Effect.mapError((cause) =>
+                    installationError(
+                      "activate",
+                      "Could not replace the damaged Antigravity runtime. Check for open processes and try again.",
+                      cause,
                     ),
                   ),
-            ),
-            Effect.mapError((error) =>
-              isInstallationError(error) && error.operation === "verify"
-                ? error
-                : installationError(
+                );
+                const publishError = yield* fs.rename(pairDirectory, destination).pipe(
+                  retryWhileWindowsHoldsHandles,
+                  Effect.as(null),
+                  Effect.catch((cause) => Effect.succeed(cause)),
+                );
+                if (publishError !== null) {
+                  const restored = yield* fs.rename(displaced, destination).pipe(
+                    retryWhileWindowsHoldsHandles,
+                    Effect.as(true),
+                    Effect.orElseSucceed(() => false),
+                  );
+                  return yield* installationError(
                     "activate",
-                    "Could not publish the Antigravity runtime. The previous release is unchanged. Try again.",
-                    cause,
-                  ),
+                    restored
+                      ? "Could not replace the damaged Antigravity runtime. The previous files were restored. Try again."
+                      : "Could not replace the damaged Antigravity runtime, and the damaged files could not be restored. Reinstall Antigravity.",
+                    publishError,
+                  );
+                }
+                const activateError = yield* writeAndActivate(pointerDirectory).pipe(
+                  Effect.as(null),
+                  Effect.catch((cause) => Effect.succeed(cause)),
+                );
+                if (activateError !== null) {
+                  const rolledBack = yield* Effect.gen(function* () {
+                    yield* removeReleaseDirectory(destination);
+                    yield* fs.rename(displaced, destination).pipe(retryWhileWindowsHoldsHandles);
+                  }).pipe(
+                    Effect.as(true),
+                    Effect.orElseSucceed(() => false),
+                  );
+                  return yield* installationError(
+                    "activate",
+                    rolledBack
+                      ? "Could not activate the repaired Antigravity runtime. The previous files were restored. Try again."
+                      : "Could not activate the repaired Antigravity runtime, and the damaged files could not be restored. Reinstall Antigravity.",
+                    activateError,
+                  );
+                }
+                return { _tag: "published" as const };
+              }).pipe(
+                Effect.mapError((error) =>
+                  isInstallationError(error)
+                    ? error
+                    : installationError(
+                        "activate",
+                        "Could not publish the Antigravity runtime. The previous release is unchanged. Try again.",
+                        error,
+                      ),
+                ),
+                Effect.uninterruptible,
+              ),
             ),
-          ),
-        ),
+          );
+        }),
       );
-      yield* activate();
+      if (published._tag === "existing") {
+        yield* validate(published.executable, asset.version).pipe(
+          Effect.scoped,
+          withValidationTimeout,
+        );
+        yield* activate();
+      }
     },
     Effect.scoped,
     Effect.mapError(
@@ -1160,28 +1533,38 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
               "Stop Antigravity sessions and sign-in flows before removing its managed runtime.",
             );
           }
-          const realManaged = yield* fs.realPath(managedDirectory).pipe(Effect.option);
-          if (Option.isSome(realManaged)) {
-            for (const binaryPath of protectedBinaryPaths) {
-              if (!binaryPath.trim()) continue;
-              const selected = yield* resolve(binaryPath).pipe(Effect.option);
-              if (Option.isSome(selected) && selected.value.managedVersionDirectory) {
-                return yield* installationError(
-                  "remove",
-                  "A provider instance has a custom path inside this managed runtime. Clear that path before removing it.",
-                );
-              }
-              const resolved = yield* fs.realPath(binaryPath).pipe(Effect.option);
-              const candidate = Option.getOrElse(resolved, () => path.resolve(binaryPath));
-              if (candidate.startsWith(`${realManaged.value}${path.sep}`)) {
-                return yield* installationError(
-                  "remove",
-                  "A provider instance has a custom path inside this managed runtime. Clear that path before removing it.",
-                );
-              }
-            }
+          if (yield* fs.exists(managedDirectory)) {
+            yield* withManagedLock(
+              "remove",
+              Effect.gen(function* () {
+                const realManaged = yield* fs.realPath(managedDirectory).pipe(Effect.option);
+                if (Option.isSome(realManaged)) {
+                  for (const binaryPath of protectedBinaryPaths) {
+                    if (!binaryPath.trim()) continue;
+                    const selected = yield* resolveUnlocked(binaryPath).pipe(Effect.option);
+                    if (Option.isSome(selected) && selected.value.managedVersionDirectory) {
+                      return yield* installationError(
+                        "remove",
+                        "A provider instance has a custom path inside this managed runtime. Clear that path before removing it.",
+                      );
+                    }
+                    const resolved = yield* fs.realPath(binaryPath).pipe(Effect.option);
+                    const candidate = Option.getOrElse(resolved, () => path.resolve(binaryPath));
+                    if (candidate.startsWith(`${realManaged.value}${path.sep}`)) {
+                      return yield* installationError(
+                        "remove",
+                        "A provider instance has a custom path inside this managed runtime. Clear that path before removing it.",
+                      );
+                    }
+                  }
+                }
+                yield* unlockDirectoryTree(versionsDirectory);
+                yield* fs
+                  .remove(managedDirectory, { recursive: true, force: true })
+                  .pipe(retryWhileWindowsHoldsHandles);
+              }),
+            );
           }
-          yield* fs.remove(managedDirectory, { recursive: true, force: true });
           yield* SubscriptionRef.update(
             state,
             (current) =>
@@ -1210,21 +1593,42 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
     const canRemove = yield* fs.exists(managedDirectory);
     yield* SubscriptionRef.update(state, (current) => ({ ...current, canRemove }));
     if (!(yield* fs.exists(activePath))) return;
-    const active = yield* readRecord(activePath, ActiveRelease);
-    const installed = yield* completedRelease(active.releaseId);
-    yield* SubscriptionRef.update(state, (current) => ({
-      ...current,
-      installedVersion: installed.version,
-    }));
+    yield* gate.withPermit(
+      withManagedLock(
+        "activate",
+        Effect.gen(function* () {
+          if (!(yield* fs.exists(activePath))) {
+            const exists = yield* fs.exists(managedDirectory);
+            yield* SubscriptionRef.update(state, (current) => ({ ...current, canRemove: exists }));
+            return;
+          }
+          const active = yield* readRecord(activePath, ActiveRelease);
+          const installed = yield* completedRelease(active.releaseId);
+          if (installed.harnessPath === null && installed.managedVersionDirectory !== null) {
+            yield* lockReleaseDirectory(
+              installed.managedVersionDirectory,
+              installed.executablePath,
+              false,
+            );
+          }
+          yield* SubscriptionRef.update(state, (current) => ({
+            ...current,
+            installedVersion: installed.version,
+          }));
+        }),
+      ),
+    );
   }).pipe(
-    Effect.catch(() =>
+    Effect.catch((cause) =>
       SubscriptionRef.update(
         state,
         (current) =>
           ({
             ...current,
             phase: "failed",
-            message: "The managed Antigravity runtime is incomplete. Remove it and reinstall.",
+            message: isInstallationError(cause)
+              ? cause.detail
+              : "The managed Antigravity runtime is incomplete. Remove it and reinstall.",
           }) satisfies ProviderInstallState,
       ),
     ),
