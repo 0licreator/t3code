@@ -1,6 +1,11 @@
 import type { EnvironmentConnectionPhase } from "@t3tools/client-runtime/connection";
 import { peerLinkHealth, type PeerLinkHealth } from "@t3tools/client-runtime/state/peerLinks";
-import type { EnvironmentId, EnvironmentMachineKind, PeerLinkSummary } from "@t3tools/contracts";
+import {
+  AuthMcpClientAccess,
+  type EnvironmentId,
+  type EnvironmentMachineKind,
+  type PeerLinkSummary,
+} from "@t3tools/contracts";
 import type * as DateTime from "effect/DateTime";
 
 export const FLEET_CLIENT_NODE_ID = "client";
@@ -146,18 +151,29 @@ export interface FleetNeighborhood {
 }
 
 /**
- * What a node reaches and what reaches it, one hop only. A link does not chain: A linked to B
- * and B linked to C gives A's agents nothing on C, so following links further would lie.
+ * What a node reaches and what reaches it, one hop only, plus how this client gets there. A link
+ * does not chain: A linked to B and B linked to C gives A's agents nothing on C, so following
+ * links further would lie.
  */
 export function fleetNeighborhood(graph: FleetGraph, focus: FleetFocus): FleetNeighborhood {
   const nodes = new Set<string>();
   const edges = new Set<string>();
+  const sources = new Set<string>();
   for (const edge of graph.edges) {
     const touches =
       focus.kind === "edge" ? edge.id === focus.id : edge.from === focus.id || edge.to === focus.id;
     if (!touches) continue;
     edges.add(edge.id);
     nodes.add(edge.from).add(edge.to);
+    if (edge.kind === "link" && (focus.kind === "edge" || edge.to === focus.id)) {
+      sources.add(edge.from);
+    }
+  }
+  // The client reaches the focus through whichever environment holds the link to it.
+  for (const edge of graph.edges) {
+    if (edge.kind !== "connection" || !sources.has(edge.to)) continue;
+    edges.add(edge.id);
+    nodes.add(edge.from);
   }
   if (focus.kind === "node" && graph.nodes.some((node) => node.id === focus.id)) {
     nodes.add(focus.id);
@@ -171,11 +187,13 @@ export const isLinkEdge = (edge: FleetEdge): edge is FleetLinkEdge => edge.kind 
 export const linkNeedsAttention = (health: PeerLinkHealth) =>
   health.kind !== "reachable" || health.expiresInDays !== null;
 
-/** Changes exactly when the layout would: membership, labels that order a bay, and wiring. */
+/** Changes exactly when the layout would: membership, labels and access that order a bay, and wiring. */
 export function fleetShapeKey(graph: FleetGraph): string {
   return [
     ...graph.nodes.map((node) => `${node.kind}\u0000${node.id}\u0000${node.label}`),
-    ...graph.edges.map((edge) => edge.id),
+    ...graph.edges.map((edge) =>
+      edge.kind === "link" ? `${edge.id}\u0000${edge.link.access}` : edge.id,
+    ),
   ].join("\n");
 }
 
@@ -190,41 +208,61 @@ export interface FleetEdgeGeometry {
   readonly d: string;
   /** Arrowhead tip and the horizontal direction it points. Connections have none. */
   readonly arrow: { readonly x: number; readonly y: number; readonly dir: 1 | -1 } | null;
-  /** Where an individually routed link shows its access; null where the target chip shows it. */
+  /** Where a link between two drawn machines shows its access. Connections have none. */
   readonly badge: { readonly x: number; readonly y: number } | null;
 }
 
-/** The shared wiring from one environment to the bay of machines only it reaches. */
-export interface FleetHarness {
+/**
+ * The machines only one environment reaches, at one access level. They share a tray and one
+ * line from that environment, so forty machines under one host cost a line per level, not forty.
+ */
+export interface FleetLane {
+  readonly id: string;
   readonly parentId: string;
+  readonly access: AuthMcpClientAccess;
   readonly memberIds: ReadonlyArray<string>;
+  /** The links this lane's line stands for, in member order. */
+  readonly edgeIds: ReadonlyArray<string>;
+  readonly rect: FleetRect;
+  /** Where the level's name goes, left of the machines. */
+  readonly label: FleetRect;
   readonly d: string;
+  readonly arrow: { readonly x: number; readonly y: number };
 }
 
 export interface FleetLayout {
   readonly nodes: ReadonlyMap<string, FleetRect>;
+  /** Connections and individually routed links. A lane's links are drawn by the lane. */
   readonly edges: ReadonlyMap<string, FleetEdgeGeometry>;
-  readonly harnesses: ReadonlyArray<FleetHarness>;
+  readonly lanes: ReadonlyArray<FleetLane>;
   readonly width: number;
   readonly height: number;
 }
 
-const CLIENT = { width: 148, height: 44 };
-const CARD = { width: 184, height: 52 };
+const CLIENT = { width: 136, height: 36 };
+const CARD = { width: 204, height: 56 };
 const CHIP = { width: 128, height: 28 };
-const SPINE_GAP = 64;
-const GROUP_GAP = 28;
-const LANE_FIRST = 20;
-const LANE_STEP = 12;
-const BAY_GAP = 36;
-const RAIL_INSET = 6;
-const CHIP_INSET = 22;
-const CHIP_ROW_GAP = 8;
-const BUS_HEIGHT = 14;
+const SPINE_GAP = 72;
+const GROUP_GAP = 32;
+const BRACKET_FIRST = 20;
+const BRACKET_STEP = 12;
+const TRUNK = 20;
+const FAN = 76;
+const ARROW_LENGTH = 6;
+const LANE_PAD = 8;
+const LANE_LABEL = 144;
+const LANE_GAP = 8;
+const CHIP_GAP = 6;
+const MAX_BAY_COLUMNS = 6;
 const PORT_OFFSET = 12;
 const CORNER = 8;
+const BADGE = { width: 34, height: 24 };
 
-const bayColumns = (count: number) => (count <= 3 ? 1 : count <= 8 ? 2 : count <= 18 ? 3 : 4);
+const ACCESS_ORDER = AuthMcpClientAccess.literals;
+
+/** Wide enough that a big bay stays near the canvas's shape, never wider than its fullest lane. */
+const bayColumns = (total: number, fullestLane: number) =>
+  Math.max(1, Math.min(fullestLane, MAX_BAY_COLUMNS, Math.ceil(Math.sqrt(total / 2.2))));
 
 const labelOrder = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
 
@@ -248,48 +286,61 @@ function elbowPath(x0: number, y0: number, viaX: number, x1: number, y1: number)
 
 /**
  * Three columns, left to right: this client, the environments it knows, and the machines seen
- * only through a link. Each of those sits in a bay beside the first environment that links to
- * it, wired from one trunk so forty machines under one host cost one line, not forty. Positions
- * come from the graph alone, so the same fleet always draws the same map.
+ * only through a link. Each of those sits beside the first environment that links to it, in a
+ * lane per access level with the most access on top, and one trunk fans out to the lanes.
+ * Positions come from the graph alone, so the same fleet always draws the same map.
  */
 export function layoutFleetGraph(graph: FleetGraph): FleetLayout {
   const nodes = new Map<string, FleetRect>();
   const edges = new Map<string, FleetEdgeGeometry>();
-  const harnesses: FleetHarness[] = [];
+  const lanes: FleetLane[] = [];
   const links = graph.edges.filter(isLinkEdge);
   const byId = new Map(graph.nodes.map((node) => [node.id, node]));
   const environments = graph.nodes.filter((node) => node.kind === "environment");
   const environmentIds = new Set(environments.map((node) => node.id));
 
-  const bayOf = new Map<string, string[]>();
+  const bayOf = new Map<string, FleetLinkEdge[]>();
   const homed = new Set<string>();
   for (const link of links) {
     if (byId.get(link.to)?.kind !== "target" || homed.has(link.to)) continue;
     homed.add(link.to);
-    bayOf.set(link.from, [...(bayOf.get(link.from) ?? []), link.to]);
+    bayOf.set(link.from, [...(bayOf.get(link.from) ?? []), link]);
   }
 
   const sameColumn = links.filter((link) => environmentIds.has(link.to));
   const cardX = CLIENT.width + SPINE_GAP;
   const cardRight = cardX + CARD.width;
   const channelWidth =
-    sameColumn.length === 0 ? 0 : LANE_FIRST + LANE_STEP * (sameColumn.length - 1);
-  const bayX = cardRight + channelWidth + BAY_GAP;
+    sameColumn.length === 0 ? 0 : BRACKET_FIRST + BRACKET_STEP * (sameColumn.length - 1);
+  const splitX = cardRight + channelWidth + TRUNK;
+  const bayX = splitX + FAN;
+  const chipX0 = bayX + LANE_PAD + LANE_LABEL;
+  const rowPitch = CHIP.height + CHIP_GAP;
 
   let y = 0;
   let width = cardRight + channelWidth;
-  const stubs = new Set<string>();
+  const inLane = new Set<string>();
   for (const environment of environments) {
-    const members = (bayOf.get(environment.id) ?? []).toSorted(
-      (left, right) =>
-        labelOrder.compare(byId.get(left)?.label ?? "", byId.get(right)?.label ?? "") ||
-        (left < right ? -1 : 1),
-    );
-    const columns = members.length === 0 ? 0 : bayColumns(members.length);
-    const rows = columns === 0 ? 0 : Math.ceil(members.length / columns);
-    const busHeight = columns > 1 ? BUS_HEIGHT : 0;
-    const rowPitch = CHIP.height + CHIP_ROW_GAP;
-    const bayHeight = rows === 0 ? 0 : busHeight + rows * rowPitch - CHIP_ROW_GAP;
+    const bay = bayOf.get(environment.id) ?? [];
+    const groups = ACCESS_ORDER.toReversed()
+      .map((access) => ({
+        access,
+        members: bay
+          .filter((link) => link.link.access === access)
+          .toSorted(
+            (left, right) =>
+              labelOrder.compare(byId.get(left.to)?.label ?? "", byId.get(right.to)?.label ?? "") ||
+              (left.to < right.to ? -1 : 1),
+          ),
+      }))
+      .filter((group) => group.members.length > 0);
+    const columns = bayColumns(bay.length, Math.max(0, ...groups.map((g) => g.members.length)));
+    const laneHeight = (count: number) =>
+      LANE_PAD * 2 + Math.ceil(count / columns) * rowPitch - CHIP_GAP;
+    const bayHeight =
+      groups.reduce((sum, group) => sum + laneHeight(group.members.length) + LANE_GAP, 0) -
+      (groups.length === 0 ? 0 : LANE_GAP);
+    const laneWidth = LANE_PAD * 2 + LANE_LABEL + columns * (CHIP.width + CHIP_GAP) - CHIP_GAP;
     const groupHeight = Math.max(CARD.height, bayHeight);
     const centerY = y + groupHeight / 2;
     nodes.set(environment.id, {
@@ -299,48 +350,37 @@ export function layoutFleetGraph(graph: FleetGraph): FleetLayout {
       height: CARD.height,
     });
 
-    if (columns > 0) {
-      const bayTop = centerY - bayHeight / 2;
-      const columnPitch = CHIP_INSET + CHIP.width;
-      const chipCenterY = (row: number) => bayTop + busHeight + row * rowPitch + CHIP.height / 2;
-      const railX = (column: number) => bayX + column * columnPitch + RAIL_INSET;
-      const lastRowOf = (column: number) => Math.ceil((members.length - column) / columns) - 1;
-      members.forEach((id, index) => {
-        const column = index % columns;
-        const row = Math.floor(index / columns);
-        const chipX = bayX + column * columnPitch + CHIP_INSET;
-        nodes.set(id, {
-          x: chipX,
-          y: chipCenterY(row) - CHIP.height / 2,
+    let laneY = centerY - bayHeight / 2;
+    for (const group of groups) {
+      const height = laneHeight(group.members.length);
+      const laneCenter = laneY + height / 2;
+      group.members.forEach((link, index) => {
+        inLane.add(link.id);
+        nodes.set(link.to, {
+          x: chipX0 + (index % columns) * (CHIP.width + CHIP_GAP),
+          y: laneY + LANE_PAD + Math.floor(index / columns) * rowPitch,
           width: CHIP.width,
           height: CHIP.height,
         });
-        const stub = `link:${environment.id}>${id}`;
-        stubs.add(stub);
-        edges.set(stub, {
-          d: `M${railX(column)} ${chipCenterY(row)}H${chipX}`,
-          arrow: { x: chipX, y: chipCenterY(row), dir: 1 },
-          badge: null,
-        });
       });
-      const wires = [`M${cardRight} ${centerY}H${railX(0)}`];
-      if (columns === 1) {
-        if (rows > 1) wires.push(`M${railX(0)} ${chipCenterY(0)}V${chipCenterY(rows - 1)}`);
-      } else {
-        const busY = bayTop + CORNER / 2;
-        const first = railX(0);
-        const last = railX(columns - 1);
-        wires.push(
-          `M${first} ${chipCenterY(lastRowOf(0))}V${busY + CORNER}Q${first} ${busY} ${first + CORNER} ${busY}` +
-            `H${last - CORNER}Q${last} ${busY} ${last} ${busY + CORNER}V${chipCenterY(lastRowOf(columns - 1))}`,
-        );
-        for (let column = 1; column < columns - 1; column += 1) {
-          wires.push(`M${railX(column)} ${busY}V${chipCenterY(lastRowOf(column))}`);
-        }
-      }
-      harnesses.push({ parentId: environment.id, memberIds: members, d: wires.join("") });
-      width = Math.max(width, bayX + columns * columnPitch);
+      const endX = bayX - ARROW_LENGTH;
+      const bend = (endX - splitX) * 0.55;
+      lanes.push({
+        id: `lane:${environment.id}:${group.access}`,
+        parentId: environment.id,
+        access: group.access,
+        memberIds: group.members.map((link) => link.to),
+        edgeIds: group.members.map((link) => link.id),
+        rect: { x: bayX, y: laneY, width: laneWidth, height },
+        label: { x: bayX + LANE_PAD, y: laneY, width: LANE_LABEL - LANE_PAD, height },
+        d:
+          `M${cardRight} ${centerY}H${splitX}` +
+          `C${splitX + bend} ${centerY} ${endX - bend} ${laneCenter} ${endX} ${laneCenter}`,
+        arrow: { x: bayX, y: laneCenter },
+      });
+      laneY += height + LANE_GAP;
     }
+    if (groups.length > 0) width = Math.max(width, bayX + laneWidth);
     y += groupHeight + GROUP_GAP;
   }
   const height = Math.max(CLIENT.height, y - GROUP_GAP);
@@ -377,36 +417,53 @@ export function layoutFleetGraph(graph: FleetGraph): FleetLayout {
     });
   }
 
-  // Shorter spans take the inner lanes, so brackets nest instead of crossing.
+  // Two links between the same pair run side by side, so the second badge steps below the first.
+  const badges: Array<{ readonly x: number; readonly y: number }> = [];
+  const placeBadge = (x: number, startY: number) => {
+    let badgeY = startY;
+    while (
+      badges.some(
+        (other) => Math.abs(other.x - x) < BADGE.width && Math.abs(other.y - badgeY) < BADGE.height,
+      )
+    ) {
+      badgeY += BADGE.height;
+    }
+    const badge = { x, y: badgeY };
+    badges.push(badge);
+    return badge;
+  };
+
+  // Shorter spans take the inner brackets, so they nest instead of crossing.
   const span = (link: FleetLinkEdge) => Math.abs(centerOf(link.to) - centerOf(link.from));
   sameColumn
     .toSorted((left, right) => span(left) - span(right) || (left.id < right.id ? -1 : 1))
-    .forEach((link, lane) => {
-      const laneX = cardRight + LANE_FIRST + lane * LANE_STEP;
+    .forEach((link, index) => {
+      const bracketX = cardRight + BRACKET_FIRST + index * BRACKET_STEP;
       const fromY = centerOf(link.from) - PORT_OFFSET;
       const toY = centerOf(link.to) + PORT_OFFSET;
       edges.set(link.id, {
-        d: elbowPath(cardRight, fromY, laneX, cardRight, toY),
+        d: elbowPath(cardRight, fromY, bracketX, cardRight + ARROW_LENGTH, toY),
         arrow: { x: cardRight, y: toY, dir: -1 },
-        badge: { x: laneX, y: (fromY + toY) / 2 },
+        badge: placeBadge(bracketX, (fromY + toY) / 2),
       });
     });
 
   // A machine in one environment's bay that a second environment also links to.
   for (const link of links) {
-    if (environmentIds.has(link.to) || stubs.has(link.id)) continue;
+    if (environmentIds.has(link.to) || inLane.has(link.id)) continue;
     const target = nodes.get(link.to)!;
     const fromY = centerOf(link.from) - PORT_OFFSET;
     const toY = target.y + target.height / 2;
-    const reach = Math.max(40, (target.x - cardRight) / 2);
+    const endX = target.x - ARROW_LENGTH;
+    const reach = Math.max(40, (endX - cardRight) / 2);
     edges.set(link.id, {
-      d: `M${cardRight} ${fromY}C${cardRight + reach} ${fromY} ${target.x - reach} ${toY} ${target.x} ${toY}`,
+      d: `M${cardRight} ${fromY}C${cardRight + reach} ${fromY} ${endX - reach} ${toY} ${endX} ${toY}`,
       arrow: { x: target.x, y: toY, dir: 1 },
-      badge: { x: (cardRight + target.x) / 2, y: (fromY + toY) / 2 },
+      badge: placeBadge((cardRight + target.x) / 2, (fromY + toY) / 2),
     });
   }
 
-  return { nodes, edges, harnesses, width, height };
+  return { nodes, edges, lanes, width, height };
 }
 
 export type FleetDirection = "up" | "down" | "left" | "right";
@@ -447,20 +504,22 @@ export interface FleetViewTransform {
 
 const FLEET_MIN_SCALE = 0.3;
 const FLEET_MAX_SCALE = 2;
+/** A small fleet is enlarged to fill the canvas, but not until three machines look like a poster. */
+const FLEET_FIT_MAX_SCALE = 1.25;
+const FLEET_FIT_PADDING = 36;
 
-/** Centers the whole map in the viewport, shrinking to fit but never enlarging past 1:1. */
+const fitScale = (available: number, extent: number) =>
+  Math.max(0.01, (available - FLEET_FIT_PADDING * 2) / Math.max(1, extent));
+
+/** Centers the whole map in the viewport at the largest scale that shows all of it. */
 export function fitFleetLayout(
   layout: Pick<FleetLayout, "width" | "height">,
   viewport: { readonly width: number; readonly height: number },
-  padding = 32,
 ): FleetViewTransform {
-  const scale = Math.max(
-    FLEET_MIN_SCALE,
-    Math.min(
-      1,
-      (viewport.width - padding * 2) / Math.max(1, layout.width),
-      (viewport.height - padding * 2) / Math.max(1, layout.height),
-    ),
+  const scale = Math.min(
+    FLEET_FIT_MAX_SCALE,
+    fitScale(viewport.width, layout.width),
+    fitScale(viewport.height, layout.height),
   );
   return {
     scale,
@@ -469,13 +528,26 @@ export function fitFleetLayout(
   };
 }
 
+/** How tall the canvas wants to be at this width: the fitted map plus padding, within bounds. */
+export function fleetCanvasHeight(
+  layout: Pick<FleetLayout, "width" | "height">,
+  width: number,
+  bounds: { readonly min: number; readonly max: number },
+): number {
+  const scale = Math.min(FLEET_FIT_MAX_SCALE, fitScale(width, layout.width));
+  const wanted = Math.ceil(layout.height * scale + FLEET_FIT_PADDING * 2);
+  return Math.max(bounds.min, Math.min(bounds.max, wanted));
+}
+
 /** Zooms by `factor`, keeping the map point under `anchor` where it is. */
 export function zoomFleetView(
   view: FleetViewTransform,
   factor: number,
   anchor: { readonly x: number; readonly y: number },
 ): FleetViewTransform {
-  const scale = Math.max(FLEET_MIN_SCALE, Math.min(FLEET_MAX_SCALE, view.scale * factor));
+  // A fit of a very large fleet can sit below the manual minimum; zooming out must not jump up.
+  const floor = Math.min(FLEET_MIN_SCALE, view.scale);
+  const scale = Math.max(floor, Math.min(FLEET_MAX_SCALE, view.scale * factor));
   const ratio = scale / view.scale;
   return {
     scale,

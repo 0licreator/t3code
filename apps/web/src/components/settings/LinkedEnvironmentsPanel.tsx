@@ -26,6 +26,8 @@ export function LinkedEnvironmentsPanel({
   const [view, setView] = useState<LinkedEnvironmentsView>("list");
   // The toggle moves between section headers with the view, so the pressed side takes focus back.
   const [toggled, setToggled] = useState(false);
+  // The toggle unmounts on a narrow screen; when it returns it must not take focus unasked.
+  if (!roomForMap && toggled) setToggled(false);
   if (hosts.length === 0) return null;
   const shown = roomForMap ? view : "list";
   const viewToggle = roomForMap ? (

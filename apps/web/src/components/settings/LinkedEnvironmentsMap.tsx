@@ -13,6 +13,7 @@ import {
   AppWindowIcon,
   ClockAlertIcon,
   GlobeIcon,
+  ArrowRightIcon,
   MaximizeIcon,
   MinusIcon,
   PlusIcon,
@@ -51,6 +52,7 @@ import {
 import {
   buildFleetGraph,
   fitFleetLayout,
+  fleetCanvasHeight,
   FLEET_CLIENT_NODE_ID,
   fleetEnvironmentNodeId,
   fleetNeighborhood,
@@ -60,6 +62,7 @@ import {
   type FleetEnvironmentInput,
   type FleetFocus,
   type FleetGraph,
+  type FleetLane,
   type FleetLayout,
   type FleetLinkEdge,
   type FleetNode,
@@ -78,7 +81,10 @@ type EnvironmentHost = EnvironmentPresentation;
 
 const ACCESS_LEVELS = AuthMcpClientAccess.literals;
 const accessLevel = (access: AuthMcpClientAccess) => ACCESS_LEVELS.indexOf(access);
-const LINK_STROKE_WIDTHS = [1.25, 1.75, 2.25, 2.75, 3.25];
+/** One ordinal scale for access, read only to full access: a link's line gets heavier and darker. */
+const ACCESS_STROKE_WIDTHS = [1.25, 1.75, 2.25, 2.75, 3.5];
+const ACCESS_STROKE_OPACITIES = [0.34, 0.46, 0.58, 0.72, 0.88];
+const CANVAS_HEIGHT = { min: 240, max: 640 };
 const ARROW_ROVE: Record<string, FleetDirection> = {
   ArrowUp: "up",
   ArrowDown: "down",
@@ -93,10 +99,19 @@ function healthTone(health: PeerLinkHealth): string {
   return health.expiresInDays === null ? "text-foreground/70" : "text-warning";
 }
 
-/** Dashes repeat the same message without colour: broken for unreachable, dotted for expired. */
+/** Dashes repeat the same message without colour, one pattern per kind of trouble. */
 function healthDash(health: PeerLinkHealth): string | undefined {
   if (health.kind === "expired") return "1 5";
-  return health.kind === "unreachable" || health.kind === "failing" ? "5 4" : undefined;
+  if (health.kind === "failing") return "8 3 1 3";
+  return health.kind === "unreachable" ? "5 4" : undefined;
+}
+
+/** A machine's outline carries its link's health, so the lane's shared line does not have to. */
+function healthBorder(health: PeerLinkHealth): string {
+  if (health.kind === "expired") return "border-dotted border-destructive/70";
+  if (health.kind === "failing") return "border-destructive/70";
+  if (health.kind === "unreachable") return "border-dashed border-foreground/35";
+  return health.expiresInDays === null ? "border-border" : "border-warning/70";
 }
 
 function healthLabel(health: PeerLinkHealth, gt: GT): string {
@@ -252,47 +267,60 @@ function FleetCanvas({ shapeKey, ...scene }: FleetSceneProps & { readonly shapeK
   const gt = useGT();
   const { layout, onSelect } = scene;
   const [canvas, setCanvas] = useState<HTMLDivElement | null>(null);
-  const [size, setSize] = useState<{ readonly width: number; readonly height: number } | null>(
-    null,
-  );
+  const [width, setWidth] = useState<number | null>(null);
   // A view the user set by hand holds until the map's shape changes; otherwise it fits itself.
   const [manual, setManual] = useState<{
     readonly key: string;
     readonly view: FleetViewTransform;
+    /** Set by the buttons and keys, whose jump is eased; a drag or pinch tracks the hand. */
+    readonly glide: boolean;
   } | null>(null);
   const [dragging, setDragging] = useState(false);
   const drag = useRef<{
+    readonly pointerId: number;
+    readonly key: string;
     readonly x: number;
     readonly y: number;
     readonly origin: FleetViewTransform;
     moved: boolean;
   } | null>(null);
-  const view =
-    manual?.key === shapeKey ? manual.view : size === null ? null : fitFleetLayout(layout, size);
-  const setView = (next: FleetViewTransform) => setManual({ key: shapeKey, view: next });
-  const zoom = (factor: number, anchor?: { readonly x: number; readonly y: number }) => {
+  // The canvas is as tall as the fitted map wants, so the height never feeds back into the fit.
+  const size =
+    width === null ? null : { width, height: fleetCanvasHeight(layout, width, CANVAS_HEIGHT) };
+  const held = manual?.key === shapeKey ? manual : null;
+  const view = held?.view ?? (size === null ? null : fitFleetLayout(layout, size));
+  const glide = manual !== null && (held === null || held.glide);
+  const setView = (next: FleetViewTransform, eased: boolean) =>
+    setManual({ key: shapeKey, view: next, glide: eased });
+  const zoom = (
+    factor: number,
+    anchor?: { readonly x: number; readonly y: number },
+    eased = true,
+  ) => {
     if (view === null || size === null) return;
-    setView(zoomFleetView(view, factor, anchor ?? { x: size.width / 2, y: size.height / 2 }));
+    setView(
+      zoomFleetView(view, factor, anchor ?? { x: size.width / 2, y: size.height / 2 }),
+      eased,
+    );
   };
+  // Keeps the entry so the scene eases back to the fit; its stale key marks it as not held.
+  const fit = () => setManual((current) => (current === null ? null : { ...current, key: "" }));
   const onWheel = useEffectEvent((event: WheelEvent) => {
     // Plain scrolling stays the page's; a pinch or Ctrl/Cmd + wheel zooms the map.
     if (!event.ctrlKey && !event.metaKey) return;
     event.preventDefault();
     const bounds = (event.currentTarget as HTMLElement).getBoundingClientRect();
-    zoom(Math.exp(-event.deltaY * 0.01), {
-      x: event.clientX - bounds.left,
-      y: event.clientY - bounds.top,
-    });
+    zoom(
+      Math.exp(-event.deltaY * 0.01),
+      { x: event.clientX - bounds.left, y: event.clientY - bounds.top },
+      false,
+    );
   });
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- measures the canvas with ResizeObserver, and React's wheel listener is passive so it cannot stop the page zooming
   useEffect(() => {
     if (canvas === null) return;
     const stopObserving = observeResize(canvas, ([entry]) => {
-      if (!entry) return;
-      const { width, height } = entry.contentRect;
-      setSize((current) =>
-        current?.width === width && current.height === height ? current : { width, height },
-      );
+      if (entry) setWidth(entry.contentRect.width);
     });
     canvas.addEventListener("wheel", onWheel, { passive: false });
     return () => {
@@ -316,6 +344,7 @@ function FleetCanvas({ shapeKey, ...scene }: FleetSceneProps & { readonly shapeK
       if (inside) return current;
       return {
         key: shapeKey,
+        glide: true,
         view: {
           scale: shown.scale,
           x: size.width / 2 - (rect.x + rect.width / 2) * shown.scale,
@@ -326,24 +355,38 @@ function FleetCanvas({ shapeKey, ...scene }: FleetSceneProps & { readonly shapeK
   };
 
   const onPointerDown = (event: PointerEvent<HTMLDivElement>) => {
-    if (event.button !== 0 || view === null) return;
+    // One pointer owns a drag: a second finger neither restarts it nor ends it.
+    if (event.button !== 0 || view === null || drag.current !== null) return;
     if ((event.target as Element).closest("[data-fleet-item],[data-fleet-controls]")) return;
-    drag.current = { x: event.clientX, y: event.clientY, origin: view, moved: false };
+    drag.current = {
+      pointerId: event.pointerId,
+      key: shapeKey,
+      x: event.clientX,
+      y: event.clientY,
+      origin: view,
+      moved: false,
+    };
     event.currentTarget.setPointerCapture(event.pointerId);
   };
   const onPointerMove = (event: PointerEvent<HTMLDivElement>) => {
     const current = drag.current;
-    if (current === null) return;
+    if (current === null || current.pointerId !== event.pointerId) return;
+    // The map was laid out again mid-drag, so the origin belongs to a view that is gone.
+    if (current.key !== shapeKey) {
+      drag.current = null;
+      setDragging(false);
+      return;
+    }
     const dx = event.clientX - current.x;
     const dy = event.clientY - current.y;
     if (!current.moved && Math.hypot(dx, dy) < 4) return;
     if (!current.moved) setDragging(true);
     current.moved = true;
-    setView({ ...current.origin, x: current.origin.x + dx, y: current.origin.y + dy });
+    setView({ ...current.origin, x: current.origin.x + dx, y: current.origin.y + dy }, false);
   };
-  const endDrag = (cancelled: boolean) => {
+  const endDrag = (event: PointerEvent<HTMLDivElement>, cancelled: boolean) => {
     const current = drag.current;
-    if (current === null) return;
+    if (current === null || current.pointerId !== event.pointerId) return;
     drag.current = null;
     setDragging(false);
     if (!current.moved && !cancelled) onSelect(null);
@@ -352,7 +395,7 @@ function FleetCanvas({ shapeKey, ...scene }: FleetSceneProps & { readonly shapeK
     if (event.ctrlKey || event.metaKey || event.altKey) return;
     if (event.key === "+" || event.key === "=") zoom(1.25);
     else if (event.key === "-") zoom(0.8);
-    else if (event.key === "0") setManual(null);
+    else if (event.key === "0") fit();
     else if (event.key === "Escape") onSelect(null);
     else return;
     event.preventDefault();
@@ -362,11 +405,13 @@ function FleetCanvas({ shapeKey, ...scene }: FleetSceneProps & { readonly shapeK
     <div
       ref={setCanvas}
       data-dragging={dragging || undefined}
-      className="relative h-[min(30rem,70vh)] min-h-72 cursor-grab touch-none overflow-clip rounded-t-xl bg-background/50 select-none data-dragging:cursor-grabbing"
+      data-glide={glide || undefined}
+      className="relative min-h-60 cursor-grab touch-none overflow-clip rounded-t-xl bg-background/50 select-none data-dragging:cursor-grabbing data-glide:transition-[background-size,background-position] data-glide:duration-200 data-glide:ease-out motion-reduce:transition-none"
       style={
-        view === null
+        view === null || size === null
           ? undefined
           : {
+              height: size.height,
               backgroundImage: "radial-gradient(circle, var(--border) 1px, transparent 1.5px)",
               backgroundSize: `${24 * view.scale}px ${24 * view.scale}px`,
               backgroundPosition: `${view.x}px ${view.y}px`,
@@ -374,13 +419,14 @@ function FleetCanvas({ shapeKey, ...scene }: FleetSceneProps & { readonly shapeK
       }
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
-      onPointerUp={() => endDrag(false)}
-      onPointerCancel={() => endDrag(true)}
+      onPointerUp={(event) => endDrag(event, false)}
+      onPointerCancel={(event) => endDrag(event, true)}
+      onLostPointerCapture={(event) => endDrag(event, true)}
       onKeyDown={onKeyDown}
     >
       {view === null ? null : (
         <div
-          className="absolute top-0 left-0 origin-top-left in-data-dragging:will-change-transform"
+          className="absolute top-0 left-0 origin-top-left in-data-dragging:will-change-transform in-data-glide:transition-transform in-data-glide:duration-200 in-data-glide:ease-out motion-reduce:transition-none"
           style={{
             width: layout.width,
             height: layout.height,
@@ -390,6 +436,7 @@ function FleetCanvas({ shapeKey, ...scene }: FleetSceneProps & { readonly shapeK
           <FleetScene {...scene} onReveal={reveal} />
         </div>
       )}
+      <HealthKey graph={scene.graph} />
       <div
         data-fleet-controls
         className="absolute top-2 right-2 flex cursor-default items-center gap-1 rounded-lg border border-border/60 bg-popover/90 p-0.5 shadow-xs/5"
@@ -414,13 +461,45 @@ function FleetCanvas({ shapeKey, ...scene }: FleetSceneProps & { readonly shapeK
           size="icon-xs"
           variant="ghost"
           aria-label={gt("Fit the map to view")}
-          disabled={manual?.key !== shapeKey}
-          onClick={() => setManual(null)}
+          disabled={held === null}
+          onClick={fit}
         >
           <MaximizeIcon />
         </Button>
       </div>
     </div>
+  );
+}
+
+/** Which marks a machine can carry, and only the ones on the map right now. */
+function HealthKey({ graph }: { readonly graph: FleetGraph }) {
+  const gt = useGT();
+  const samples: ReadonlyArray<PeerLinkHealth> = [
+    { kind: "reachable", expiresInDays: null },
+    { kind: "reachable", expiresInDays: 1 },
+    { kind: "unreachable", detail: null },
+    { kind: "failing", detail: "" },
+    { kind: "expired" },
+  ];
+  const mark = (health: PeerLinkHealth) =>
+    health.kind === "reachable" ? `${health.kind}:${health.expiresInDays === null}` : health.kind;
+  const present = new Set(graph.edges.filter(isLinkEdge).map((edge) => mark(edge.health)));
+  const shown = samples.filter((sample) => present.has(mark(sample)));
+  if (shown.length === 0) return null;
+  return (
+    <ul
+      aria-label={gt("How a link is doing")}
+      className="pointer-events-none absolute bottom-2 left-3 flex items-center gap-3 text-2xs text-muted-foreground"
+    >
+      {shown.map((sample) => (
+        <li key={mark(sample)} className="flex items-center gap-1.5">
+          <HealthGlyph health={sample} />
+          {sample.kind === "reachable" && sample.expiresInDays !== null
+            ? gt("Expires within days")
+            : healthLabel(sample, gt)}
+        </li>
+      ))}
+    </ul>
   );
 }
 
@@ -485,8 +564,11 @@ const FleetScene = memo(function FleetScene({
   const fade = (dimmed: boolean) =>
     cn(
       "transition-opacity duration-150 motion-reduce:transition-none",
-      dimmed && "opacity-25 forced-colors:opacity-50",
+      dimmed && "opacity-45 forced-colors:opacity-60",
     );
+  const laneLit = (lane: FleetLane) =>
+    lit === null ||
+    (lit.nodes.has(lane.parentId) && lane.memberIds.some((id) => lit.nodes.has(id)));
   const hoverProps = (target: FleetFocus) => ({
     onPointerEnter: () => setHover(target),
     onPointerLeave: () => setHover(null),
@@ -547,38 +629,38 @@ const FleetScene = memo(function FleetScene({
         {graph.edges.map((edge) => {
           const geometry = layout.edges.get(edge.id);
           if (edge.kind !== "connection" || geometry === undefined) return null;
+          const onPath = lit?.edges.has(edge.id) === true;
           return (
             <path
               key={edge.id}
               d={geometry.d}
               stroke="currentColor"
-              strokeWidth="1"
+              strokeWidth={onPath ? 1.5 : 1}
               strokeDasharray={edge.connected ? undefined : "2 5"}
               className={cn(
-                "text-muted-foreground/70",
-                fade(lit !== null && !lit.edges.has(edge.id)),
+                onPath ? "text-foreground/70" : "text-muted-foreground/60",
+                fade(lit !== null && !onPath),
               )}
             />
           );
         })}
-        {layout.harnesses.map((harness) => (
-          <path
-            key={harness.parentId}
-            d={harness.d}
-            stroke="currentColor"
-            strokeWidth="1.5"
-            className={cn(
-              "text-foreground/45",
-              fade(
-                lit !== null &&
-                  !(
-                    lit.nodes.has(harness.parentId) &&
-                    harness.memberIds.some((id) => lit.nodes.has(id))
-                  ),
-              ),
-            )}
-          />
-        ))}
+        {layout.lanes.map((lane) => {
+          const level = accessLevel(lane.access);
+          const onPath = laneLit(lane);
+          return (
+            <g
+              key={lane.id}
+              className={cn("text-foreground", fade(lit !== null && !onPath))}
+              opacity={lit !== null && onPath ? 1 : ACCESS_STROKE_OPACITIES[level]}
+            >
+              <path d={lane.d} stroke="currentColor" strokeWidth={ACCESS_STROKE_WIDTHS[level]} />
+              <path
+                d={`M${lane.arrow.x - 8} ${lane.arrow.y - 4.5}L${lane.arrow.x} ${lane.arrow.y}L${lane.arrow.x - 8} ${lane.arrow.y + 4.5}Z`}
+                fill="currentColor"
+              />
+            </g>
+          );
+        })}
         {links.map((edge) => {
           const geometry = layout.edges.get(edge.id);
           if (geometry === undefined) return null;
@@ -597,7 +679,7 @@ const FleetScene = memo(function FleetScene({
                 stroke="currentColor"
                 // Selection also thickens the line, for when colour is forced.
                 strokeWidth={
-                  (LINK_STROKE_WIDTHS[accessLevel(edge.link.access)] ?? 2) + (selected ? 1 : 0)
+                  (ACCESS_STROKE_WIDTHS[accessLevel(edge.link.access)] ?? 2) + (selected ? 1 : 0)
                 }
                 strokeDasharray={healthDash(edge.health)}
               />
@@ -607,7 +689,7 @@ const FleetScene = memo(function FleetScene({
                   fill="currentColor"
                 />
               ) : null}
-              {/* Pointer shortcut only: the badge or the target chip is the link's control. */}
+              {/* Pointer shortcut only: the badge is the link's control. */}
               <path
                 aria-hidden
                 data-fleet-item=""
@@ -622,6 +704,35 @@ const FleetScene = memo(function FleetScene({
           );
         })}
       </svg>
+      {layout.lanes.map((lane) => (
+        <div
+          key={lane.id}
+          aria-hidden
+          style={{
+            left: lane.rect.x,
+            top: lane.rect.y,
+            width: lane.rect.width,
+            height: lane.rect.height,
+          }}
+          className={cn(
+            "absolute rounded-lg border border-border/70 bg-foreground/3",
+            fade(!laneLit(lane)),
+          )}
+        >
+          <div
+            style={{ left: lane.label.x - lane.rect.x, width: lane.label.width }}
+            className="absolute inset-y-0 flex items-center gap-2"
+          >
+            <AccessMeter access={lane.access} className="text-foreground/85" />
+            <span className="line-clamp-2 min-w-0 flex-1 text-2xs leading-3.5 font-medium text-foreground">
+              {m(accessConfig[lane.access].label)}
+            </span>
+            <span className="pr-2.5 text-2xs text-muted-foreground tabular-nums">
+              {lane.memberIds.length}
+            </span>
+          </div>
+        </div>
+      ))}
       {links.map((edge) => {
         const badge = layout.edges.get(edge.id)?.badge;
         if (!badge) return null;
@@ -664,11 +775,11 @@ const FleetScene = memo(function FleetScene({
               {...nodeProps(node, rect, node.label)}
               className={cn(
                 nodeClass(node.id),
-                "gap-2 rounded-full bg-foreground px-4 text-background forced-colors:border",
+                "gap-2 rounded-full border border-border bg-background px-3 text-muted-foreground hover:text-foreground aria-pressed:text-foreground",
               )}
             >
-              <ClientIcon aria-hidden className="size-4 shrink-0 opacity-80" />
-              <span className="truncate text-sm font-medium">{node.label}</span>
+              <ClientIcon aria-hidden className="size-3.5 shrink-0" />
+              <span className="truncate text-xs">{node.label}</span>
             </button>
           );
         }
@@ -694,16 +805,14 @@ const FleetScene = memo(function FleetScene({
               )}
               className={cn(
                 nodeClass(node.id),
-                "gap-1.5 rounded-md border border-dashed border-foreground/30 bg-background px-2 text-foreground hover:border-foreground/60",
+                "gap-2 rounded-md border bg-card px-2 text-foreground/90 hover:border-foreground/50 hover:text-foreground",
+                first ? healthBorder(first.health) : "border-border",
               )}
             >
-              {first ? (
-                <AccessMeter access={first.link.access} className="text-foreground/80" />
-              ) : null}
-              <span className="min-w-0 flex-1 truncate text-2xs leading-none font-medium">
-                {node.label}
+              <span className="flex w-3 shrink-0 justify-center">
+                {first ? <HealthGlyph health={first.health} /> : null}
               </span>
-              {first ? <HealthGlyph health={first.health} /> : null}
+              <span className="min-w-0 flex-1 truncate text-2xs leading-none">{node.label}</span>
             </button>
           );
         }
@@ -721,7 +830,7 @@ const FleetScene = memo(function FleetScene({
             {...nodeProps(node, rect, `${node.label}, ${status}`)}
             className={cn(
               nodeClass(node.id),
-              "gap-2.5 rounded-xl border border-border bg-card px-2.5 text-card-foreground shadow-xs/5 hover:border-foreground/40",
+              "gap-3 rounded-xl border border-foreground/20 bg-card px-3 text-card-foreground shadow-sm/5 hover:border-foreground/45",
             )}
           >
             <span className="relative flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted text-foreground/80 forced-colors:border">
@@ -735,7 +844,7 @@ const FleetScene = memo(function FleetScene({
               />
             </span>
             <span className="min-w-0 flex-1">
-              <span className="block truncate text-sm leading-4 font-medium">{node.label}</span>
+              <span className="block truncate text-sm leading-5 font-semibold">{node.label}</span>
               <span
                 className={cn(
                   "block truncate text-2xs leading-4",
@@ -760,21 +869,39 @@ function FleetInspector({
   selection,
   onSelect,
 }: Omit<FleetSceneProps, "layout"> & { readonly hosts: ReadonlyArray<EnvironmentHost> }) {
+  const gt = useGT();
+  const panel = useRef<HTMLDivElement>(null);
   const links = graph.edges.filter(isLinkEdge);
   const node =
     selection?.kind === "node" ? graph.nodes.find((entry) => entry.id === selection.id) : undefined;
   const edge =
     selection?.kind === "edge" ? links.find((entry) => entry.id === selection.id) : undefined;
   const labelOf = (id: string) => graph.nodes.find((entry) => entry.id === id)?.label ?? "";
+  // Choosing inside the panel replaces the control that was pressed, so focus stays on the panel.
+  const selectWithin = (focus: FleetFocus) => {
+    onSelect(focus);
+    panel.current?.focus();
+  };
+  const reading = graph.nodes.filter((entry) => entry.kind === "environment");
+  const settled = reading.every(
+    (entry) => entry.phase !== "connected" || entry.outgoing !== "loading",
+  );
+  const readable = reading.some((entry) => entry.outgoing === "loaded");
   return (
-    <div className="min-h-36 px-3 py-3 text-xs sm:px-4">
+    <div
+      ref={panel}
+      tabIndex={-1}
+      role="group"
+      aria-label={gt("Details")}
+      className="min-h-24 border-t border-border/60 px-3 py-3 text-xs outline-none sm:px-4"
+    >
       {edge ? (
         <LinkDetails
           key={edge.id}
           edge={edge}
           sourceLabel={labelOf(edge.from)}
           targetLabel={labelOf(edge.to)}
-          onSelect={onSelect}
+          onSelect={selectWithin}
         />
       ) : node ? (
         <NodeDetails
@@ -785,13 +912,12 @@ function FleetInspector({
           canHostLinks={hosts.some(
             (host) => fleetEnvironmentNodeId(host.environmentId) === node.id,
           )}
-          onSelect={onSelect}
+          onSelect={selectWithin}
         />
-      ) : links.length === 0 &&
-        !graph.nodes.some((n) => n.kind === "environment" && n.outgoing === "loading") ? (
+      ) : links.length === 0 && settled && readable ? (
         <NoLinksYet hosts={hosts} />
       ) : (
-        <FleetLegend graph={graph} links={links} />
+        <FleetSummary graph={graph} links={links} settled={settled} readable={readable} />
       )}
     </div>
   );
@@ -844,112 +970,54 @@ function LinkFromHere({
   );
 }
 
-function LineSample({
-  className,
-  dash,
-  width = 1.75,
-}: {
-  className: string;
-  dash?: string;
-  width?: number;
-}) {
-  return (
-    <svg aria-hidden viewBox="0 0 28 8" className={cn("h-2 w-7 shrink-0", className)}>
-      <path
-        d="M1 4H27"
-        stroke="currentColor"
-        strokeWidth={width}
-        strokeDasharray={dash}
-        strokeLinecap="round"
-      />
-    </svg>
-  );
-}
-
-function FleetLegend({
+function FleetSummary({
   graph,
   links,
+  settled,
+  readable,
 }: {
   readonly graph: FleetGraph;
   readonly links: ReadonlyArray<FleetLinkEdge>;
+  readonly settled: boolean;
+  readonly readable: boolean;
 }) {
   const gt = useGT();
-  const m = useMessages();
   const attention = links.filter((edge) => linkNeedsAttention(edge.health)).length;
-  const row = "flex items-center gap-2 text-muted-foreground";
   return (
     <div>
       <InspectorHeading
         detail={
-          attention === 0
-            ? gt("Select a machine or a link for details.")
-            : gt("{count, plural, one {# link needs attention.} other {# links need attention.}}", {
-                count: attention,
-              })
+          !settled
+            ? gt("Loading links…")
+            : !readable
+              ? gt("Links could not be loaded")
+              : attention === 0
+                ? gt("Select a machine or a link for details.")
+                : gt(
+                    "{count, plural, one {# link needs attention.} other {# links need attention.}}",
+                    { count: attention },
+                  )
         }
       >
-        {gt(
-          "{machines, plural, one {# machine} other {# machines}}, {links, plural, =0 {no links} one {# link} other {# links}}",
-          { machines: graph.nodes.length - 1, links: links.length },
-        )}
-      </InspectorHeading>
-      <div className="grid gap-x-8 gap-y-3 sm:grid-cols-3">
-        <ul className="space-y-1.5" aria-label={gt("Access a link grants")}>
-          {ACCESS_LEVELS.map((access) => (
-            <li key={access} className={row}>
-              <AccessMeter access={access} className="text-foreground/80" />
-              {m(accessConfig[access].label)}
-            </li>
-          ))}
-        </ul>
-        <ul className="space-y-1.5" aria-label={gt("How a link is doing")}>
-          <li className={row}>
-            <LineSample className="text-foreground/70" />
-            {gt("Reachable")}
-          </li>
-          <li className={row}>
-            <LineSample className="text-warning" />
-            {gt("Expires within days")}
-          </li>
-          <li className={row}>
-            <LineSample className="text-muted-foreground" dash="5 4" />
-            {gt("Not answering")}
-          </li>
-          <li className={row}>
-            <LineSample className="text-destructive" dash="1 5" />
-            {gt("Expired", { $context: "status of a link between two machines" })}
-          </li>
-          <li className={row}>
-            <LineSample className="text-muted-foreground/70" width={1} />
-            {gt("Connected to this app")}
-          </li>
-        </ul>
-        <ul className="space-y-1.5" aria-label={gt("Kinds of machine")}>
-          <li className={row}>
-            <span
-              aria-hidden
-              className="h-3 w-6 shrink-0 rounded-sm border border-border bg-card"
-            />
-            {gt("Environment this app knows")}
-          </li>
-          <li className={row}>
-            <span
-              aria-hidden
-              className="h-3 w-6 shrink-0 rounded-sm border border-dashed border-foreground/40"
-            />
-            {gt("Known only through a link")}
-          </li>
-          <li className="text-muted-foreground">
-            {gt(
-              "A link reaches one machine and stops there. It does not pass on to the machines that one links to.",
+        {links.length === 0 && !(settled && readable)
+          ? gt("{machines, plural, one {# machine} other {# machines}}", {
+              machines: graph.nodes.length - 1,
+            })
+          : gt(
+              "{machines, plural, one {# machine} other {# machines}}, {links, plural, =0 {no links} one {# link} other {# links}}",
+              { machines: graph.nodes.length - 1, links: links.length },
             )}
-          </li>
-        </ul>
-      </div>
+      </InspectorHeading>
+      <p className="max-w-xl text-muted-foreground">
+        {gt(
+          "A link reaches one machine and stops there. It does not pass on to the machines that one links to.",
+        )}
+      </p>
     </div>
   );
 }
 
+/** One link as a row: what it reaches, the access in words, where, and how it is doing. */
 function LinkButton({
   edge,
   label,
@@ -961,23 +1029,35 @@ function LinkButton({
 }) {
   const gt = useGT();
   const m = useMessages();
+  const attention = linkNeedsAttention(edge.health);
   return (
     <li>
       <button
         type="button"
-        className="flex w-full cursor-pointer items-center gap-2 rounded-md px-1.5 py-1 text-left outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+        className="grid w-full cursor-pointer grid-cols-[auto_minmax(0,1fr)_minmax(0,1fr)_auto] items-center gap-x-3 rounded-md px-1.5 py-1 text-left outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset lg:grid-cols-[auto_minmax(0,10rem)_minmax(0,10rem)_minmax(0,1fr)_auto]"
         onClick={() => onSelect({ kind: "edge", id: edge.id })}
       >
         <AccessMeter access={edge.link.access} className="text-foreground/80" />
-        <span className="min-w-0 flex-1 truncate text-foreground">{label}</span>
-        <span className="sr-only">{m(accessConfig[edge.link.access].label)}</span>
+        <span className="truncate font-medium text-foreground">{label}</span>
+        <span className="truncate text-foreground/80">
+          {m(accessConfig[edge.link.access].label)}
+        </span>
+        <span className="hidden truncate font-mono text-2xs text-muted-foreground lg:block">
+          {edge.link.urls[0]}
+        </span>
         <span
           className={cn(
-            "shrink-0",
-            linkNeedsAttention(edge.health) ? healthTone(edge.health) : "text-muted-foreground",
+            "flex shrink-0 items-center gap-1.5",
+            attention ? healthTone(edge.health) : "text-muted-foreground",
           )}
         >
-          {healthLabel(edge.health, gt)}
+          <HealthGlyph health={edge.health} />
+          {attention
+            ? healthLabel(edge.health, gt)
+            : gt("Expires {date}", {
+                date: formatAccessTimestamp(DateTime.formatIso(edge.link.expiresAt)),
+                $context: "the date a link between two machines stops working",
+              })}
         </span>
       </button>
     </li>
@@ -1056,6 +1136,7 @@ function NodeDetails({
               : node.outgoing === "loading"
                 ? gt("Loading linked environments…")
                 : null;
+  const loaded = node.kind === "environment" && node.outgoing === "loaded";
   return (
     <div>
       <InspectorHeading
@@ -1072,56 +1153,72 @@ function NodeDetails({
       >
         {node.label}
       </InspectorHeading>
-      {note ? <p className="mb-2 max-w-xl text-muted-foreground">{note}</p> : null}
-      <div className="grid gap-x-8 gap-y-3 sm:grid-cols-2">
-        {node.kind === "environment" && node.outgoing === "loaded" ? (
+      {node.kind === "target" ? (
+        // A machine known only through its links is its links, so each one is shown in full.
+        <div className="space-y-4">
+          {incoming.map((edge) => (
+            <LinkDetails
+              key={edge.id}
+              edge={edge}
+              sourceLabel={labelOf(edge.from)}
+              targetLabel={node.label}
+              onSelect={onSelect}
+            />
+          ))}
+        </div>
+      ) : null}
+      {note ? <p className="mt-2 mb-2 max-w-xl text-muted-foreground">{note}</p> : null}
+      {node.kind === "environment" ? (
+        <div className="space-y-3">
+          {loaded || canHostLinks ? (
+            <section>
+              <div className="mb-1 flex min-h-6 items-center gap-3">
+                {loaded ? (
+                  <h4 className="font-medium text-foreground">
+                    {gt(
+                      "{count, plural, =0 {Links to no one} one {Links to # machine} other {Links to # machines}}",
+                      { count: out.length },
+                    )}
+                  </h4>
+                ) : null}
+                {canHostLinks ? (
+                  <ul>
+                    <LinkFromHere environmentId={node.environmentId}>{null}</LinkFromHere>
+                  </ul>
+                ) : null}
+              </div>
+              <ul className="-mx-1.5 max-h-48 overflow-y-auto">
+                {out.map((edge) => (
+                  <LinkButton
+                    key={edge.id}
+                    edge={edge}
+                    label={labelOf(edge.to)}
+                    onSelect={onSelect}
+                  />
+                ))}
+              </ul>
+            </section>
+          ) : null}
           <section>
-            <div className="mb-1 flex min-h-6 items-center justify-between gap-2">
-              <h4 className="font-medium text-foreground">
-                {gt(
-                  "{count, plural, =0 {Links to no one} one {Links to # machine} other {Links to # machines}}",
-                  {
-                    count: out.length,
-                  },
-                )}
-              </h4>
-              {canHostLinks ? (
-                <ul>
-                  <LinkFromHere environmentId={node.environmentId}>{null}</LinkFromHere>
-                </ul>
-              ) : null}
-            </div>
+            <h4 className="mb-1 flex min-h-6 items-center font-medium text-foreground">
+              {gt(
+                "{count, plural, =0 {No known machine links here} one {Linked from # machine} other {Linked from # machines}}",
+                { count: incoming.length },
+              )}
+            </h4>
             <ul className="-mx-1.5 max-h-48 overflow-y-auto">
-              {out.map((edge) => (
+              {incoming.map((edge) => (
                 <LinkButton
                   key={edge.id}
                   edge={edge}
-                  label={labelOf(edge.to)}
+                  label={labelOf(edge.from)}
                   onSelect={onSelect}
                 />
               ))}
             </ul>
           </section>
-        ) : null}
-        <section>
-          <h4 className="mb-1 flex min-h-6 items-center font-medium text-foreground">
-            {gt(
-              "{count, plural, =0 {No known machine links here} one {Linked from # machine} other {Linked from # machines}}",
-              { count: incoming.length },
-            )}
-          </h4>
-          <ul className="-mx-1.5 max-h-48 overflow-y-auto">
-            {incoming.map((edge) => (
-              <LinkButton
-                key={edge.id}
-                edge={edge}
-                label={labelOf(edge.from)}
-                onSelect={onSelect}
-              />
-            ))}
-          </ul>
-        </section>
-      </div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1160,9 +1257,11 @@ function LinkDetails({
           >
             {sourceLabel}
           </button>
-          <span className="text-muted-foreground">
-            {gt("links to", { $context: "between two machine names: A links to B" })}
-          </span>
+          <ArrowRightIcon
+            role="img"
+            aria-label={gt("links to", { $context: "between two machine names: A links to B" })}
+            className="size-3.5 text-muted-foreground"
+          />
           <button
             type="button"
             className={endpoint}
@@ -1185,7 +1284,7 @@ function LinkDetails({
       <dl className="grid max-w-2xl grid-cols-[auto_1fr] gap-x-4 gap-y-1.5">
         <dt className={term}>{gt("Access", { $context: "access level" })}</dt>
         <dd>
-          <span className="flex items-center gap-2 text-foreground">
+          <span className="flex items-center gap-2 font-medium text-foreground">
             <AccessMeter access={link.access} className="text-foreground/80" />
             {m(access.label)}
           </span>
@@ -1207,6 +1306,14 @@ function LinkDetails({
           {gt("Expires", { $context: "label before the date a link expires" })}
         </dt>
         <dd className="text-foreground">{when(link.expiresAt)}</dd>
+        <dt className={term}>{gt("Addresses")}</dt>
+        <dd className="min-w-0 font-mono text-2xs break-all text-foreground">
+          {link.urls.map((url) => (
+            <span key={url} className="block">
+              {url}
+            </span>
+          ))}
+        </dd>
         <dt className={term}>
           {gt("Linked", { $context: "label before the date a link was made" })}
         </dt>
@@ -1217,14 +1324,6 @@ function LinkDetails({
             <dd className="text-foreground">{when(link.lastReachedAt)}</dd>
           </>
         ) : null}
-        <dt className={term}>{gt("Addresses")}</dt>
-        <dd className="min-w-0 font-mono text-2xs break-all text-foreground">
-          {link.urls.map((url) => (
-            <span key={url} className="block">
-              {url}
-            </span>
-          ))}
-        </dd>
       </dl>
     </div>
   );
