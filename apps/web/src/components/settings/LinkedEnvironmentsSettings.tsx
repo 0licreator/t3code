@@ -10,13 +10,13 @@ import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
-import { peerLinkHealth } from "@t3tools/client-runtime/state/peerLinks";
+import { peerLinkHealth, type PeerLinkHealth } from "@t3tools/client-runtime/state/peerLinks";
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import { PlusIcon } from "lucide-react";
 import { T, useGT, useMessages, Var } from "gt-react";
-import { useId, useRef, useState } from "react";
+import { type ReactNode, useId, useRef, useState } from "react";
 
 import { requestConfirmDialog } from "~/confirmDialog";
 import { mintPairingCodeOn } from "~/state/peerPairingCode";
@@ -60,10 +60,12 @@ export function LinkedEnvironmentsSettings({
   environmentId,
   environmentLabel,
   isSearchTarget,
+  titleAction,
 }: {
   readonly environmentId: EnvironmentId;
   readonly environmentLabel: string | null;
   readonly isSearchTarget: boolean;
+  readonly titleAction?: ReactNode;
 }) {
   const searchableSetting = useSearchableSetting();
   const gt = useGT();
@@ -90,6 +92,7 @@ export function LinkedEnvironmentsSettings({
     <SettingsSection
       {...(isSearchTarget ? { id: search.id } : {})}
       title={environmentLabel === null ? search.title : `${search.title} · ${environmentLabel}`}
+      titleAction={titleAction}
       headerAction={canLink ? <LinkEnvironmentAction environmentId={environmentId} /> : null}
     >
       {links.error ? (
@@ -127,38 +130,9 @@ function LinkedEnvironmentRow({
   const m = useMessages();
   const nowMinute = useNowMinute();
   const health = peerLinkHealth(link, DateTime.makeUnsafe(nowMinute));
-  const unlink = useAtomCommand(peerLinkEnvironment.unlink, { label: UNLINK_COMMAND_LABEL });
   const canUnlink = useAtomValue(peerLinkEnvironment.unlink.permissionAtom(environmentId));
-  const [busy, setBusy] = useState(false);
-  const forget = async () => {
-    const confirmed = await (requestConfirmDialog(
-      gt(
-        "Forget {label}? Agents here stop working there. Revoke \"T3 Code · …\" in {label}''s Sharing & access to end the session there too.",
-        { label: link.label },
-      ),
-      { variant: "destructive" },
-    ) ?? Promise.resolve(false));
-    if (!confirmed) return;
-    setBusy(true);
-    const result = await unlink({ environmentId, input: { environmentId: link.environmentId } });
-    setBusy(false);
-    if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
-      failureToast(gt("Could not forget the link"), String(squashAtomCommandFailure(result)));
-    }
-  };
-  const status =
-    health.kind === "expired"
-      ? gt("Expired. Link it again with a new pairing code.")
-      : health.kind === "unreachable"
-        ? (health.detail ?? gt("Not answering right now."))
-        : health.kind === "failing"
-          ? health.detail
-          : health.expiresInDays !== null
-            ? gt(
-                "{days, plural, one {Expires in {days} day. Link it again to renew.} other {Expires in {days} days. Link it again to renew.}}",
-                { days: health.expiresInDays },
-              )
-            : gt("Reachable");
+  const { busy, forget } = useForgetPeerLink(environmentId, link);
+  const status = peerLinkStatusText(health, gt);
   return (
     <div className={ITEM_ROW_CLASSNAME}>
       <div className={ITEM_ROW_INNER_CLASSNAME}>
@@ -201,7 +175,11 @@ function LinkedEnvironmentRow({
   );
 }
 
-function LinkEnvironmentAction({ environmentId }: { readonly environmentId: EnvironmentId }) {
+export function LinkEnvironmentAction({
+  environmentId,
+}: {
+  readonly environmentId: EnvironmentId;
+}) {
   const gt = useGT();
   const [open, setOpen] = useState(false);
   const machines = useLinkableMachines(environmentId, open);
@@ -417,4 +395,44 @@ function LinkEnvironmentAction({ environmentId }: { readonly environmentId: Envi
       </DialogPopup>
     </Dialog>
   );
+}
+
+/** What a link's health means for the user, in a sentence. */
+export function peerLinkStatusText(health: PeerLinkHealth, gt: ReturnType<typeof useGT>): string {
+  return health.kind === "expired"
+    ? gt("Expired. Link it again with a new pairing code.")
+    : health.kind === "unreachable"
+      ? (health.detail ?? gt("Not answering right now."))
+      : health.kind === "failing"
+        ? health.detail
+        : health.expiresInDays !== null
+          ? gt(
+              "{days, plural, one {Expires in {days} day. Link it again to renew.} other {Expires in {days} days. Link it again to renew.}}",
+              { days: health.expiresInDays },
+            )
+          : gt("Reachable");
+}
+
+/** Forgets `link` from `environmentId` after the user confirms. */
+export function useForgetPeerLink(environmentId: EnvironmentId, link: PeerLinkSummary) {
+  const gt = useGT();
+  const unlink = useAtomCommand(peerLinkEnvironment.unlink, { label: UNLINK_COMMAND_LABEL });
+  const [busy, setBusy] = useState(false);
+  const forget = async () => {
+    const confirmed = await (requestConfirmDialog(
+      gt(
+        "Forget {label}? Agents here stop working there. Revoke \"T3 Code · …\" in {label}''s Sharing & access to end the session there too.",
+        { label: link.label },
+      ),
+      { variant: "destructive" },
+    ) ?? Promise.resolve(false));
+    if (!confirmed) return;
+    setBusy(true);
+    const result = await unlink({ environmentId, input: { environmentId: link.environmentId } });
+    setBusy(false);
+    if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+      failureToast(gt("Could not forget the link"), String(squashAtomCommandFailure(result)));
+    }
+  };
+  return { busy, forget };
 }
