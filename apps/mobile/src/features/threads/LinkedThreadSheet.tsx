@@ -1,4 +1,4 @@
-import { useNavigation, type StaticScreenProps } from "@react-navigation/native";
+import { StackActions, useNavigation, type StaticScreenProps } from "@react-navigation/native";
 import {
   isLinkedThreadWorking,
   linkedThreadFailure,
@@ -21,8 +21,9 @@ import { ScreenContent } from "../../components/ui/ScreenContent";
 import { SheetHeader } from "../../components/ui/SheetHeader";
 import { SelectableMarkdownText } from "../../native/SelectableMarkdownText";
 import { useEnvironments } from "../../state/environments";
-import { useLinkedThreadSession } from "../../state/linkedThread";
+import { useConnectLinkedEnvironment, useLinkedThreadSession } from "../../state/linkedThread";
 import { useMarkdownPreviewStyles } from "../files/FileMarkdownPreview";
+import { useOpenLinkedThread } from "./useOpenLinkedThread";
 
 type LinkedThreadRouteParams = {
   readonly viaEnvironmentId: string;
@@ -148,6 +149,20 @@ function LinkedThreadView(props: { readonly target: LinkedThreadTarget }) {
   // Follows new items only while the reader is already at the end.
   const atEnd = useRef(true);
   const working = transcript !== null && isLinkedThreadWorking(transcript);
+  const connection = useConnectLinkedEnvironment(target);
+  const openThread = useOpenLinkedThread();
+  const connect = async () => {
+    const outcome = await connection.connect();
+    if (outcome.type === "unreachable") return;
+    // This sheet closes either way: the thread opens where the app is now connected, or the
+    // add-environment screen takes its place.
+    if (outcome.type === "connected") {
+      navigation.goBack();
+      openThread({ environmentId: target.environmentId, threadId: target.threadId });
+      return;
+    }
+    navigation.dispatch(StackActions.replace("ConnectionsNew", { linked: target.environmentId }));
+  };
   return (
     <View collapsable={false} className="flex-1 bg-sheet">
       <SheetHeader
@@ -158,9 +173,37 @@ function LinkedThreadView(props: { readonly target: LinkedThreadTarget }) {
             : gt("Read-only · on {label} via {via}", { label, via })
         }
         onClose={() => navigation.goBack()}
-        // A "Connect to interact" action belongs here once this app can pair with the linked environment.
       />
       <ScreenContent>
+        <View className="gap-2 px-5 pt-2">
+          <View className="self-start">
+            <Button
+              size="compact"
+              tone="secondary"
+              label={gt("Connect to interact")}
+              loading={connection.state.phase === "connecting"}
+              onPress={() => void connect()}
+            />
+          </View>
+          {connection.state.phase === "unreachable" ? (
+            <View
+              accessibilityLiveRegion="polite"
+              className="gap-1 rounded-2xl border border-danger-border bg-danger px-3.5 py-3"
+            >
+              <Text className="font-t3-medium text-sm text-danger-foreground">
+                {gt("{label} is not reachable from this device", {
+                  label: connection.state.label,
+                })}
+              </Text>
+              <Text className="text-sm text-danger-foreground">
+                <T>
+                  Join a network it is on, such as its Tailscale network, and try again. You can
+                  keep reading here.
+                </T>
+              </Text>
+            </View>
+          ) : null}
+        </View>
         <ScrollView
           ref={scroll}
           nestedScrollEnabled
